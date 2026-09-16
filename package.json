@@ -9,6 +9,7 @@
   "files": [
     "lib",
     "assets",
+    "cordis.patch.yml",
     "README.md",
     "THIRD_PARTY_NOTICES.md"
   ],
