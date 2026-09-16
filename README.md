@@ -68,7 +68,7 @@ npm install && npm run build && npm run build:client
 ## 卸载
 
 ```sh
-dsh plugin remove dsh-android-pane
+dsh plugin remove @dsh-external/dsh-android-pane
 ```
 
 卸载即停流、回收 adb 子进程；状态在 `<DSH_HOME>/dsh-android-pane/`（截图、state.json），可整目录删除。
