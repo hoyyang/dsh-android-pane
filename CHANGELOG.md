@@ -12,4 +12,5 @@
   - config 新增 flagSecureCheck（默认 true）。
 
 ### Fixed
+- 头部按钮收起/展开圆角弧度不一致：收起态由 10px 圆角方统一为展开态的胶囊弧度（999px），过渡属性同步清理。
 - （随 B22 一并修复）README 工具清单 7→10（debug/ui/install_ime 早已上线但文档未更新）。

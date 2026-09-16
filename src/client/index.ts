@@ -19,12 +19,12 @@ const BTN_CSS = `
 .dap-btn{position:relative;display:inline-flex;align-items:center;justify-content:flex-start;gap:0;
   margin-left:auto;
   width:34px;min-width:34px;height:31px;padding:0 8px;box-sizing:border-box;
-  border-radius:10px;cursor:pointer;font-size:12.5px;font-weight:600;letter-spacing:.2px;
+  border-radius:999px;cursor:pointer;font-size:12.5px;font-weight:600;letter-spacing:.2px;
   color:#eaf4f0;background:linear-gradient(135deg,#24405c 0%,#14665a 55%,#0f7a52 100%);
   border:1px solid rgba(61,213,166,.38);overflow:hidden;user-select:none;vertical-align:middle;
-  transition:width .34s cubic-bezier(.22,1,.36,1),margin-left .34s cubic-bezier(.22,1,.36,1),border-radius .34s cubic-bezier(.22,1,.36,1),box-shadow .28s ease,border-color .28s ease,filter .28s ease;
+  transition:width .34s cubic-bezier(.22,1,.36,1),margin-left .34s cubic-bezier(.22,1,.36,1),box-shadow .28s ease,border-color .28s ease,filter .28s ease;
   box-shadow:0 1px 8px rgba(20,150,110,.28),inset 0 1px 0 rgba(255,255,255,.12)}
-.dap-btn:hover{width:148px;border-radius:999px;border-color:rgba(61,213,166,.85);
+.dap-btn:hover{width:148px;border-color:rgba(61,213,166,.85);
   box-shadow:0 6px 22px rgba(35,200,150,.5),0 0 0 1px rgba(61,213,166,.25),inset 0 1px 0 rgba(255,255,255,.18);
   filter:brightness(1.08)}
 .dap-btn:active{filter:brightness(.92);transition-duration:.06s}
