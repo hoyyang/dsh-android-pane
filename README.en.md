@@ -50,7 +50,7 @@ On attach, scrcpy-server is pushed to the device and runs H.264 encoding via app
 
 ## Reliability
 
-Delivered through the dsh-plugin-build pipeline: isolated staging verification, uninstall/reinstall idempotence, cold-boot triple-fault static checks, and a ten-gate review; tested on emulators and multiple real phones (H.264 streaming, injection, Chinese input, FLAG_SECURE degradation chain, multi-device concurrency).
+Delivered through the dsh-plugin-build pipeline: isolated staging verification, uninstall/reinstall idempotence, cold-boot triple-fault static checks, and a ten-gate review; tested on emulators and multiple real phones (H.264 streaming, injection, Chinese input, FLAG_SECURE degradation chain, multi-device concurrency). Self-healing styles (v0.1.1): header button / pane styles recover within milliseconds if removed or invalidated externally, and hot-reloaded style updates apply without a full page refresh.
 
 ## FAQ
 

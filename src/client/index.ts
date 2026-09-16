@@ -65,12 +65,38 @@ const BTN_CSS = `
 .dap-btn.dap-open:hover{box-shadow:0 6px 26px rgba(56,189,248,.55),0 0 0 1px rgba(90,210,255,.3)}
 @media (prefers-reduced-motion: reduce){.dap-btn,.dap-btn .dap-ico,.dap-btn .dap-dot{animation:none!important;transition:none!important}}
 `
-function ensureBtnStyles(): void {
-  if (document.getElementById('dsh-android-pane-btn-css') != null) return
-  const el = document.createElement('style')
-  el.id = 'dsh-android-pane-btn-css'
-  el.textContent = BTN_CSS
-  document.head.appendChild(el)
+/** B24 样式管理：内容即版本——与在册标签逐字比对，不一致原子换新（热重载后免整页刷新）。 */
+const BTN_STYLE_ID = 'dsh-android-pane-btn-css'
+const PANE_STYLE_ID = 'dsh-android-pane-pane-css'
+const CSS_VERSION = '0.1.1'
+
+/** 挂载或换新样式标签；返回是否发生了实际写入。 */
+function upsertStyle(id: string, css: string): boolean {
+  const el = document.getElementById(id)
+  if (el == null) {
+    const tag = document.createElement('style')
+    tag.id = id
+    tag.textContent = css
+    document.head.appendChild(tag)
+    return true
+  }
+  if (el.textContent !== css) {
+    el.textContent = css
+    return true
+  }
+  return false
+}
+
+/** 标签在且内容与当前版本一致。 */
+function styleHealthy(id: string, css: string): boolean {
+  const el = document.getElementById(id)
+  return el != null && el.textContent === css
+}
+
+/** 强制重挂：先摘除再挂载（标签在但规则失效时的最后手段）。 */
+function forceRemountStyle(id: string, css: string): void {
+  document.getElementById(id)?.remove()
+  upsertStyle(id, css)
 }
 
 /** 面板样式：playful-pop × oat-terracotta 令牌化（--dap-*），停靠列 + 浮窗双形态 + 三态 + 两标志性效果。 */
@@ -168,13 +194,7 @@ const PANE_CSS = `
   .dap-btn2:hover,.dap-btn2:active{transform:none}
 }
 `
-function ensurePaneStyles(): void {
-  if (document.getElementById('dsh-android-pane-pane-css') != null) return
-  const el = document.createElement('style')
-  el.id = 'dsh-android-pane-pane-css'
-  el.textContent = PANE_CSS
-  document.head.appendChild(el)
-}
+
 
 /** playful-pop 标题字体（Fredoka）——在线加载，失败静默回退 system-ui。 */
 function ensureFontLink(): void {
@@ -1305,6 +1325,24 @@ export function PaneSidebarButton(): ReturnType<typeof h> {
     window.addEventListener('dsh-android-pane:state', onState as EventListener)
     return () => window.removeEventListener('dsh-android-pane:state', onState as EventListener)
   }, [])
+  // B24 挂载自检：样式未生效（标签被外力移除/失效）→ 逐帧强制重挂，3 次仍败 fail loud。
+  useEffect(() => {
+    let tries = 0
+    let raf = 0
+    const verify = (): void => {
+      const el = document.querySelector<HTMLElement>('.dap-btn')
+      if (el == null) return // 按钮未挂载（无会话头部），交给生命周期巡检兜底
+      if (getComputedStyle(el).borderRadius === '999px') return // 样式正常
+      if (++tries > 3) {
+        console.warn(`[${NS}] header button CSS not applying after ${tries - 1} forced remounts (expect ${CSS_VERSION})`)
+        return
+      }
+      forceRemountStyle(BTN_STYLE_ID, BTN_CSS)
+      raf = requestAnimationFrame(verify)
+    }
+    raf = requestAnimationFrame(verify)
+    return () => cancelAnimationFrame(raf)
+  }, [])
   return h(
     'button',
     {
@@ -1341,8 +1379,29 @@ export function PaneSidebarButton(): ReturnType<typeof h> {
 export const inject = ['slots']
 
 export function apply(ctx: { slots: { inject(slot: string, register: () => unknown): void; register(meta: Rec, component?: unknown): unknown }; effect(fn: () => unknown, label?: string): void }): void {
-  ensureBtnStyles()
-  ensurePaneStyles()
+  // B24 样式生命周期：同步先挂（样式先于组件注册，行为与旧版一致），随后托管自愈——
+  // ① 外力摘除/清空标签 → head MutationObserver（摘除即恢复）+ 5s 巡检兜底，恢复即 console.warn 点名（fail loud）
+  // ② 内容比对原子换新：热重载后新 CSS 立即生效，无需整页刷新
+  // ③ 卸载即净：dispose 先停巡检/断观察器再摘标签，零残留
+  upsertStyle(BTN_STYLE_ID, BTN_CSS)
+  upsertStyle(PANE_STYLE_ID, PANE_CSS)
+  ctx.effect(() => {
+    const heal = (): void => {
+      let healed = false
+      if (!styleHealthy(BTN_STYLE_ID, BTN_CSS)) { upsertStyle(BTN_STYLE_ID, BTN_CSS); healed = true }
+      if (!styleHealthy(PANE_STYLE_ID, PANE_CSS)) { upsertStyle(PANE_STYLE_ID, PANE_CSS); healed = true }
+      if (healed) console.warn(`[${NS}] style tags removed/tampered externally — re-mounted (CSS ${CSS_VERSION})`)
+    }
+    const observer = new MutationObserver(heal)
+    observer.observe(document.head, { childList: true, subtree: true })
+    const timer = window.setInterval(heal, 5000)
+    return () => {
+      window.clearInterval(timer)
+      observer.disconnect()
+      document.getElementById(BTN_STYLE_ID)?.remove()
+      document.getElementById(PANE_STYLE_ID)?.remove()
+    }
+  }, `${NS}: css lifecycle（B24 标签托管 + 摘除自愈 + 5s 巡检）`)
   ctx.effect(
     () =>
       ctx.slots.inject('shell.overlay', () =>

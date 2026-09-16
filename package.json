@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-android-pane",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Android 设备实时画面面板：模拟器/真机 H.264 串流进 DSH Web GUI，agent 可点按/截图/读控件树验证，人可上手共操作；对标 Claude Code iOS Simulator Pane",
   "private": true,
   "type": "module",
