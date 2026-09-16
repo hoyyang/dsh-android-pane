@@ -1,0 +1,7 @@
+# dsh-android-pane bundle patch: 把插件行插入 profile 装配清单
+#
+# 混合插件：同一 bundle 同时装配 host（工具+路由）与 web client（画面浮窗）。
+# 开发期可由 super-injector 热注入（dev_inject_plugin）；重启后由 profile bundles 层装配。
+- insert:
+    - id: dsh-android-pane
+      name: '@dsh-external/dsh-android-pane'
