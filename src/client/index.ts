@@ -1414,7 +1414,7 @@ export function apply(ctx: { slots: { inject(slot: string, register: () => unkno
       ctx.slots.inject('conversation.session.header.utilities', () =>
         ctx.slots.register({ name: 'conversation.session.header.utilities', id: `${NS}:entry`, order: -1 }, PaneSidebarButton as unknown as (props: never) => unknown),
       ),
-    `${NS}: header utilities entry（Session log 左侧紧贴）`,
+    `${NS}: header utilities entry（order 梯队升序勿撞值：billing -2 → 本插件 -1 → plan-board -0.5 → SLog 0 → delete 1；同值会退化成「谁最后 reload 谁靠右」乒乓换位）`,
   )
   void openCount
 }
