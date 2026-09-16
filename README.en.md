@@ -68,7 +68,7 @@ npm install && npm run build && npm run build:client
 ## Uninstall
 
 ```sh
-dsh plugin remove dsh-android-pane
+dsh plugin remove @dsh-external/dsh-android-pane
 ```
 
 Removal stops all streams and reclaims adb child processes; state lives under `<DSH_HOME>/dsh-android-pane/` (screenshots, state.json) and can be deleted freely.
