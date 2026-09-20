@@ -42,7 +42,7 @@ Zero configuration: no API keys, no DSH config edits. Requires `adb` on PATH (An
 - **Chinese input**: `android_pane_install_ime` (one-time ADBKeyboard IME setup; Chinese text goes through clipboard paste).
 - **Element-level ops**: `android_pane_ui` find/click/setText — fuzzy text matching instead of blind coordinates.
 - **Secure-page detection switch**: config `flagSecureCheck` (default true).
-- **深度定制系统**: input injection requires "USB debugging (Security settings)"; otherwise the pane degrades to view-only.
+- **Vendor-customized Android**: input injection requires "USB debugging (Security settings)"; otherwise the pane degrades to view-only.
 
 ## How it works
 
@@ -55,7 +55,7 @@ Delivered through the dsh-plugin-build pipeline: isolated staging verification, 
 ## FAQ
 
 - **Black screen?** Usually a FLAG_SECURE page (banking/password managers) — the pane shows a banner with a mitigation chain; on normal pages, check `adb devices` first.
-- **Taps do nothing?** 深度定制系统 needs "USB debugging (Security settings)".
+- **Taps do nothing?** Vendor-customized Android needs "USB debugging (Security settings)".
 - **Low fps?** Concurrent devices share the bandwidth; detach the ones you don't need.
 
 ## Build from source

@@ -42,7 +42,7 @@ dsh plugin add github:hoyyang/dsh-android-pane
 - **中文输入**：`android_pane_install_ime`（一次性装 ADBKeyboard 输入法，中文经剪贴板粘贴）。
 - **元素级操作**：`android_pane_ui` 按 find/click/setText，文本模糊匹配控件，替代盲点坐标。
 - **安全页面检测开关**：config `flagSecureCheck`（默认 true）。
-- **深度定制系统**：注入点击需打开「USB 调试（安全设置）」，否则面板自动降为只看。
+- **部分厂商深度定制系统**：注入点击需打开「USB 调试（安全设置）」，否则面板自动降为只看。
 
 ## 工作原理
 
@@ -55,7 +55,7 @@ attach 时把 scrcpy-server 推上设备、以 app_process 跑 H.264 编码，�
 ## 常见问题
 
 - **画面全黑？** 多为 FLAG_SECURE 页面（银行/密码管理器），面板会出横幅并给缓解链；普通页面黑屏先确认 `adb devices` 在线。
-- **点按没反应？** 深度定制系统 需开「USB 调试（安全设置）」。
+- **点按没反应？** 部分厂商深度定制系统需开「USB 调试（安全设置）」。
 - **帧率低？** 多设备同时串流会分带宽，先 detach 不用的设备。
 
 ## 本地构建

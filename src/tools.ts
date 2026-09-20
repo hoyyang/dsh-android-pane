@@ -199,7 +199,7 @@ export function registerPaneTools(
     defineTool({
       name: 'android_pane_install_ime',
       description:
-        'One-time setup for Chinese text input: install the bundled ADBKeyboard IME on the device (a confirm dialog appears on the phone; 深度定制系统 needs "USB install" enabled) and enable it. Call once per device when Chinese text input is required.',
+        'One-time setup for Chinese text input: install the bundled ADBKeyboard IME on the device (a confirm dialog appears on the phone; custom vendor ROMs need "USB install" enabled) and enable it. Call once per device when Chinese text input is required.',
       parameters: { serial: serialParam },
       output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }] },
       execute: async (args, ctx: ToolCtx) => {
