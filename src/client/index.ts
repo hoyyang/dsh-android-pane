@@ -261,6 +261,9 @@ class StreamReader {
   private decoder: VideoDecoder | null = null
   private aborted = false
   frames = 0
+  /** 收到的 type=1 视频帧计数（到达即计，与解码成功分开）——B25：区分「收到帧解不出」（真故障）
+   *  与「根本没帧」（静态屏下 MediaCodec 无新输入帧就不产输出帧，健康静默）。 */
+  payloadSeen = 0
   private codecCfg: Uint8Array | null = null
   private curCodec: string | null = null
   lastFrameAt = 0
@@ -336,6 +339,7 @@ class StreamReader {
         // 心跳帧，跳过（也视为连接活性）
         this.lastFrameAt = Date.now()
       } else if (type === 1) {
+        this.payloadSeen++ // B25：视频帧到达即计数（看门狗据此区分「静默静止屏」与「解不出」）
         // 实测：部分编码器不设 scrcpy 的 CONFIG/KEY 标志位 → 改用 NAL 类型分析（可靠）
         const nals = annexBNalTypes(payload)
         if (nals.sps || nals.pps) {
@@ -680,9 +684,14 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
       }
       // 解码饥荒看门狗：字节在流（心跳续着）但 >12s 零解码帧——重放缓存不可解码（缺 config/IDR）的
       // 典型症状 → 重连触发服务端 ensureDecodableStream 重启会话拿新关键帧（15s 防抖）
+      // ⚠️ B25：必须有 payloadSeen>0 前提。静态屏幕下 MediaCodec surface 编码器无新输入帧就不产
+      // 输出帧（连周期 IDR 也没有）——健康流会长时间静默；没有此前提会把「画面静止」误判为断流，
+      // 每 ~15s 强制重连且重连清画布 → 黑闪循环（9 天日志 86% 订阅寿命<30s 的根因）。
+      // 「收到过视频帧但零解码」才是真故障（缓存不可解码/desync），才值得重启会话。
       if (
         this.state.mode === 'h264' && this.state.serial != null && this.stream != null &&
-        this.stream.frames === 0 && Date.now() - this.stream.startedAt > 12_000 &&
+        this.stream.payloadSeen > 0 && this.stream.frames === 0 &&
+        Date.now() - this.stream.startedAt > 12_000 &&
         Date.now() - this.lastReattachAt > 15_000
       ) {
         this.lastReattachAt = Date.now()
@@ -782,8 +791,10 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
             this.setState({ streamSize: { w: meta.w, h: meta.h } })
             const c = this.canvasRef
             if (c != null) {
-              c.width = meta.w
-              c.height = meta.h
+              // ⚠️ B25：canvas.width/height 同值赋值也会清空位图。仅尺寸变化才重设，
+              // 否则每次重连（meta 重发）都把上一帧画面抹黑——静态屏下无新帧可画，黑屏常驻。
+              if (c.width !== meta.w) c.width = meta.w
+              if (c.height !== meta.h) c.height = meta.h
             }
           },
           (reason) => {
