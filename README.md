@@ -25,7 +25,7 @@ dsh plugin add github:hoyyang/dsh-android-pane
 - **实时画面**：scrcpy-server H.264 直推 DSH 网页端，WebCodecs 硬解（本机回环 30–60fps）；scrcpy 起不来（老设备/强化安全系统）自动降级截图轮播。
 - **agent 自己会验证**：10 个上下文经济工具——点按/滑动/文本/按键/滚动/旋转（每次操作自动回截图）、uiautomator 控件树带点按坐标、mp4 录屏、host 托管调试会话（录屏 + logcat + 动作时间线）。
 - **FLAG_SECURE 黑屏自愈**：银行/密码类应用自动识别，横幅提示 + 缓解链（`adb root` → root 框架启用指引 → SECURE 位复查终局判定），仍被系统拦截时降级为可点按的控件树文本视图，每步结果明示，绝不静默。
-- **人机共屏**：面板里点=点按、拖=滑动；agent 操作时亮红色徽标（面板手势暂被拒绝），谁在开车一目了然。
+- **人机共屏**：H.264 模式中按下、拖动、抬起实时注入，支持滚轮；截图降级模式保留抬手后合成手势。设备被 agent 认领期间面板手势被拒绝，释放后才可操作；取消、切设备、关窗或失联时自动收尾。
 - **一份真正的右侧列**：停靠形态排在「会话 ｜ 右侧边栏 ｜ Android 面板 ｜ 卡片详情」的第三格，不盖会话、不被详情盖；详情开着也照常可见（详情开/关、拖宽、窗口缩放实时跟随），窄窗（<1000px）自动转浮窗。
 - **会话隔离**：一台设备同时只归一个会话；闲置 10 分钟自动释放（模拟器关机、真机仅断开）。
 - **仅本机**：所有流只允许 127.0.0.1 访问（其余一律 403），面板变更做同源校验。
@@ -63,7 +63,8 @@ attach 时把 scrcpy-server 推上设备、以 app_process 跑 H.264 编码，�
 
 ```sh
 git clone https://github.com/hoyyang/dsh-android-pane && cd dsh-android-pane
-npm install && npm run build && npm run build:client
+npm install && npm run build
+node scripts/check-input.mjs
 ```
 
 ## 卸载

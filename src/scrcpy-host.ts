@@ -53,10 +53,39 @@ export const ACTION_MOVE = 2
 const SERVER_VERSION = '3.3.4'
 const REMOTE_JAR = '/data/local/tmp/dsh_scrcpy_server.jar'
 
+export interface PanelInputEvent {
+  p: 'down' | 'move' | 'up' | 'scroll'
+  x: number
+  y: number
+  dx?: number
+  dy?: number
+}
+export interface PanelInput {
+  gesture: string
+  w: number
+  h: number
+  events: PanelInputEvent[]
+}
+
+/** Reject the whole batch: silently filtering/truncating could discard an UP. */
+export function parsePanelInput(value: unknown): PanelInput {
+  const v = value as PanelInput | null
+  if (v == null || typeof v.gesture !== 'string' || !/^[a-zA-Z0-9-]{1,80}$/.test(v.gesture) ||
+      !Number.isInteger(v.w) || !Number.isInteger(v.h) || v.w < 1 || v.h < 1 || v.w > 65535 || v.h > 65535 ||
+      !Array.isArray(v.events) || v.events.length < 1 || v.events.length > 64 ||
+      !v.events.every(e => e != null && ['down', 'move', 'up', 'scroll'].includes(e.p) &&
+        Number.isFinite(e.x) && Number.isFinite(e.y) && Math.abs(e.x) <= 2147483647 && Math.abs(e.y) <= 2147483647 &&
+        (e.p !== 'scroll' || (Number.isFinite(e.dx) && Number.isFinite(e.dy) && Math.abs(e.dx!) <= 16 && Math.abs(e.dy!) <= 16)))) {
+    throw Object.assign(new Error('Invalid panel input batch'), { code: 'bad-request' })
+  }
+  return v
+}
+
 export class StreamSession {
   private proc: ChildProcess | null = null
   private videoSock: Socket | null = null
   private controlSock: Socket | null = null
+  private panelTouch: { id: string; x: number; y: number; timer: ReturnType<typeof setTimeout> | null } | null = null
   private videoBuf = Buffer.alloc(0)
   private gotConfig = false
   private closed = false
@@ -326,7 +355,11 @@ export class StreamSession {
           reject(new Error('aborted'))
           return
         }
-        const s = tcpConnect({ port, host: '127.0.0.1' }, () => resolve(s))
+        const s = tcpConnect({ port, host: '127.0.0.1' }, () => {
+          // Send control packets without Nagle batching; no measured latency guarantee.
+          s.setNoDelay(true)
+          resolve(s)
+        })
         s.once('error', (e) => reject(e))
       })
     return (async () => {
@@ -412,6 +445,66 @@ export class StreamSession {
     sock.write(buf)
   }
 
+  /** One active finger per stream; IDs prevent late cleanup from releasing another viewer. */
+  injectPanelInput(input: PanelInput): void {
+    const { gesture, events, w, h } = parsePanelInput(input)
+    const size = this.touchSpace()
+    if (!events.every(e => e.p === 'up') && (w !== size.w || h !== size.h)) {
+      this.cancelPanelTouch(gesture)
+      throw Object.assign(new Error('Panel frame size changed; retry the gesture'), { code: 'input-stale' })
+    }
+    let id = this.panelTouch?.id
+    for (const e of events) {
+      if (e.p === 'down') {
+        if (id != null) throw Object.assign(new Error('Another panel gesture is active'), { code: 'input-busy' })
+        id = gesture
+      } else if (e.p === 'move' && id !== gesture) {
+        throw Object.assign(new Error('Panel gesture expired'), { code: 'input-stale' })
+      } else if (e.p === 'up' && id === gesture) id = undefined
+      else if (e.p === 'scroll' && id != null) {
+        throw Object.assign(new Error('Finish the active touch before scrolling'), { code: 'input-busy' })
+      }
+    }
+    try {
+      for (const e of events) {
+        if (e.p === 'scroll') this.scroll(e.x, e.y, e.dx!, e.dy!)
+        else if (e.p === 'up') {
+          if (this.panelTouch?.id === gesture) {
+            this.panelTouch.x = e.x
+            this.panelTouch.y = e.y
+            this.cancelPanelTouch(gesture)
+          }
+        } else {
+          if (e.p === 'down') this.panelTouch = { id: gesture, x: e.x, y: e.y, timer: null }
+          this.injectTouch(e.x, e.y, e.p === 'down' ? ACTION_DOWN : ACTION_MOVE)
+          this.panelTouch!.x = e.x
+          this.panelTouch!.y = e.y
+        }
+      }
+      if (this.panelTouch?.id === gesture) {
+        if (this.panelTouch.timer != null) clearTimeout(this.panelTouch.timer)
+        // Held touches renew every 750ms; browser death releases within 2s.
+        this.panelTouch.timer = setTimeout(() => this.cancelPanelTouch(gesture, false), 2000)
+      }
+    } catch (e) {
+      this.cancelPanelTouch(gesture, false)
+      throw e
+    }
+  }
+
+  cancelPanelTouch(gesture?: string, strict = true): void {
+    const touch = this.panelTouch
+    if (touch == null || (gesture != null && gesture !== touch.id)) return
+    try { this.injectTouch(touch.x, touch.y, ACTION_UP) }
+    catch (e) {
+      if (strict) throw e // Explicit UP must not falsely report success.
+      this.log('Panel touch release failed; closing control socket: ' + String(e))
+      this.controlSock?.destroy()
+    }
+    this.panelTouch = null
+    if (touch.timer != null) clearTimeout(touch.timer)
+  }
+
   injectTouch(x: number, y: number, action: number): void {
     // ⚠️ 协议语义（scrcpy Controller.injectTouch）：x/y 在 w/h 所标定的坐标系里，
     // server 按 (deviceSize / w,h) 缩放到设备坐标。客户端发的是「流坐标」（canvas 空间），
@@ -423,6 +516,8 @@ export class StreamSession {
     // 编码=真手指语义（对齐 adb input swipe 的 touchscreen 行为，App 侧滚动手势才生效）：
     // pointerId=0（FINGER 工具）、全程 buttons=0（手指无按钮态——button 类 abort 从根上消除）。
     const { w, h } = this.touchSpace()
+    x = Math.max(0, Math.min(w - 1, Math.round(x)))
+    y = Math.max(0, Math.min(h - 1, Math.round(y)))
     this.touchProbe(action, x, y, w, h)
     const b = Buffer.alloc(32)
     b.writeUInt8(2, 0) // TYPE_INJECT_TOUCH_EVENT
@@ -529,17 +624,17 @@ export class StreamSession {
   }
 
   scroll(x: number, y: number, deltaX: number, deltaY: number): void {
-    // ⚠️ 3.x 协议：type1+position12(x4 y4 w2 h2)+hScroll4+vScroll4+buttons4 = 25 字节（缺 w/h 即错位）
+    // scrcpy 3.3.4: type1 + position12 + signed fixed-point scroll2+2 + buttons4 = 21B.
     const { w, h } = this.touchSpace()
-    const b = Buffer.alloc(25)
-    b.writeUInt8(3, 0) // TYPE_INJECT_SCROLL_EVENT
-    b.writeUInt32BE(x, 1)
-    b.writeUInt32BE(y, 5)
+    const b = Buffer.alloc(21)
+    b.writeUInt8(3, 0)
+    b.writeUInt32BE(Math.max(0, Math.min(w - 1, Math.round(x))), 1)
+    b.writeUInt32BE(Math.max(0, Math.min(h - 1, Math.round(y))), 5)
     b.writeUInt16BE(w, 9)
     b.writeUInt16BE(h, 11)
-    b.writeFloatBE(deltaX, 13)
-    b.writeFloatBE(deltaY, 17)
-    b.writeUInt32BE(0, 21)
+    b.writeInt16BE(Math.max(-32768, Math.min(32767, Math.trunc(deltaX * 2048))), 13)
+    b.writeInt16BE(Math.max(-32768, Math.min(32767, Math.trunc(deltaY * 2048))), 15)
+    b.writeUInt32BE(0, 17)
     this.send(b)
   }
 
@@ -568,6 +663,7 @@ export class StreamSession {
 
   /** 停止并清理（幂等）。 */
   stop(): void {
+    this.cancelPanelTouch(undefined, false)
     this.closed = true
     for (const sock of [this.videoSock, this.controlSock]) {
       try {

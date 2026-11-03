@@ -26,6 +26,21 @@ export type DeadSink = (reason: string) => void;
 export declare const ACTION_DOWN = 0;
 export declare const ACTION_UP = 1;
 export declare const ACTION_MOVE = 2;
+export interface PanelInputEvent {
+    p: 'down' | 'move' | 'up' | 'scroll';
+    x: number;
+    y: number;
+    dx?: number;
+    dy?: number;
+}
+export interface PanelInput {
+    gesture: string;
+    w: number;
+    h: number;
+    events: PanelInputEvent[];
+}
+/** Reject the whole batch: silently filtering/truncating could discard an UP. */
+export declare function parsePanelInput(value: unknown): PanelInput;
 export declare class StreamSession {
     private readonly adbPath;
     private readonly serial;
@@ -35,6 +50,7 @@ export declare class StreamSession {
     private proc;
     private videoSock;
     private controlSock;
+    private panelTouch;
     private videoBuf;
     private gotConfig;
     private closed;
@@ -88,6 +104,9 @@ export declare class StreamSession {
     private onVideoData;
     private waitForConfig;
     private send;
+    /** One active finger per stream; IDs prevent late cleanup from releasing another viewer. */
+    injectPanelInput(input: PanelInput): void;
+    cancelPanelTouch(gesture?: string, strict?: boolean): void;
     injectTouch(x: number, y: number, action: number): void;
     /** 诊断探针（注入器上下文里同步 require 不可用，必须动态 import）。 */
     private touchProbe;

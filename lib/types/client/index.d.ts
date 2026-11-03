@@ -98,6 +98,12 @@ export declare class PaneWindow extends Component<Record<string, never>, PaneWin
     private frameTotal;
     private pointer;
     private gestureMoved;
+    private inputQueue;
+    private inputInflight;
+    private inputRaf;
+    private holdTimer;
+    private screenRef;
+    private unmounted;
     private lastReattachAt;
     private h264Retries;
     private pref;
@@ -129,9 +135,17 @@ export declare class PaneWindow extends Component<Record<string, never>, PaneWin
     private startPollImg;
     private act;
     private canvasPoint;
+    /** One queue preserves touch/wheel order; only MOVE and adjacent scroll are coalesced. */
+    private queueInput;
+    private flushRealtime;
+    private stopHoldTimer;
+    private clearGesture;
     private onPointerDown;
     private onPointerMove;
     private onPointerUp;
+    private onPointerCancel;
+    private onWheelNative;
+    private bindScreen;
     private forceRelease;
     private toggleDebug;
     private toggleRecord;

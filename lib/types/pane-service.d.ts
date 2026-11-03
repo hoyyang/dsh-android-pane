@@ -245,6 +245,12 @@ export declare class PaneHub {
         serial: string;
         performed: string;
     }>;
+    private assertPanelAvailable;
+    /** Panel input stays separate from agent act: no session header can bypass the human lock. */
+    panelInput(serial: string | undefined, raw: unknown): {
+        serial: string;
+        performed: string;
+    };
     /** 工具层解析目标设备（公开入口）。 */
     serialForSession(sessionId: string, serial?: string): string;
     /** 解析会话目标设备：显式 serial 须是本会话认领的；缺省时本会话仅认领一台才可自动选。 */

@@ -10,23 +10,23 @@ export interface Config {
     flagSecureCheck: boolean;
     stateDir: string;
 }
-export declare const Config: z<Schemastery.ObjectS<{
-    adbPath: z<string, string>;
-    idleDetachMinutes: z<number, number>;
-    maxPerSession: z<number, number>;
-    globalMax: z<number, number>;
-    autoBootEmulator: z<boolean, boolean>;
-    flagSecureCheck: z<boolean, boolean>;
-    stateDir: z<string, string>;
-}>, Schemastery.ObjectT<{
-    adbPath: z<string, string>;
-    idleDetachMinutes: z<number, number>;
-    maxPerSession: z<number, number>;
-    globalMax: z<number, number>;
-    autoBootEmulator: z<boolean, boolean>;
-    flagSecureCheck: z<boolean, boolean>;
-    stateDir: z<string, string>;
-}>>;
+export declare const Config: z<Schemastery.ObjectS<NoInfer<{
+    adbPath: z<string, string, "defined">;
+    idleDetachMinutes: z<number, number, "defined">;
+    maxPerSession: z<number, number, "defined">;
+    globalMax: z<number, number, "defined">;
+    autoBootEmulator: z<boolean, boolean, "defined">;
+    flagSecureCheck: z<boolean, boolean, "defined">;
+    stateDir: z<string, string, "defined">;
+}>>, Schemastery.ObjectT<NoInfer<{
+    adbPath: z<string, string, "defined">;
+    idleDetachMinutes: z<number, number, "defined">;
+    maxPerSession: z<number, number, "defined">;
+    globalMax: z<number, number, "defined">;
+    autoBootEmulator: z<boolean, boolean, "defined">;
+    flagSecureCheck: z<boolean, boolean, "defined">;
+    stateDir: z<string, string, "defined">;
+}>>, "plain">;
 type HostCtx = Context & {
     webServer?: {
         register(route: {

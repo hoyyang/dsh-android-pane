@@ -25,7 +25,7 @@ Zero configuration: no API keys, no DSH config edits. Requires `adb` on PATH (An
 - **Live stream**: scrcpy-server H.264 straight into the DSH web UI, decoded via WebCodecs (30–60 fps on loopback); automatic fallback to screenshot polling when scrcpy can't run (old devices, hardened security builds).
 - **The agent verifies itself**: 10 context-economical tools — tap/swipe/text/key/scroll/rotate (auto-screenshot after every action), uiautomator element tree with tap coordinates, mp4 recording, host-managed debug sessions (recording + logcat + action timeline).
 - **FLAG_SECURE self-recovery**: banking/password apps are detected automatically; a banner plus a mitigation chain (`adb root` → root-framework guidance → final SECURE-flag re-check), degrading to a tappable text view of the element tree when pixels stay system-blocked — every step reported, never silent.
-- **Human + agent on one screen**: tap = tap, drag = swipe in the pane; a red badge shows when the agent is driving (panel gestures are temporarily rejected).
+- **Human + agent on one screen**: H.264 mode injects press, drag and release live, with wheel scrolling; screenshot fallback keeps synthesized gestures on release. Panel input is rejected for the entire agent claim, until release. Cancellation, device switches, closing and disconnects clean up active touches.
 - **A real right-hand column**: the docked pane sits third in "conversation | right sidebar | Android pane | card detail", covering neither the conversation nor covered by the detail — it follows detail open/close, width drags and window resizes live, and falls back to a floating window below 1000px.
 - **Session isolation**: one device belongs to one session at a time; idle sessions release devices after 10 minutes (emulators shut down, phones detach).
 - **Local-only**: all streams accept 127.0.0.1 peers only (everything else gets 403); panel mutations are same-origin checked.
@@ -63,7 +63,8 @@ Delivered through the dsh-plugin-build pipeline: isolated staging verification, 
 
 ```sh
 git clone https://github.com/hoyyang/dsh-android-pane && cd dsh-android-pane
-npm install && npm run build && npm run build:client
+npm install && npm run build
+node scripts/check-input.mjs
 ```
 
 ## Uninstall

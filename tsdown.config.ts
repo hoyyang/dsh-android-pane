@@ -34,4 +34,18 @@ const clientBundle: UserConfig = {
   },
 }
 
-export default [clientBundle] satisfies UserConfig[]
+// Desktop can refresh the entry URL but cannot evict ESM child modules.
+// Bundle local host code so a fresh entry is a fresh implementation; keep DSH peers external.
+const hostBundle: UserConfig = {
+  entry: { index: 'src/index.ts' },
+  outDir: 'lib',
+  format: 'esm',
+  platform: 'node',
+  outputOptions: { entryFileNames: 'index.js', codeSplitting: false },
+  dts: false,
+  sourcemap: true,
+  clean: false,
+  deps: { neverBundle: ['@deepseek-ai/cordis', '@deepseek-ai/schemastery', '@deepseek-ai/dsh-tools'] },
+}
+
+export default [hostBundle, clientBundle] satisfies UserConfig[]

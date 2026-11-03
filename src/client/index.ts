@@ -10,6 +10,7 @@
 import { createElement as h, Component, useState, useEffect } from 'react'
 import type { PointerEvent as RPointerEvent, ChangeEvent as RChangeEvent } from 'react'
 import { claimRootDock, DAP_DOCK_OWNER, watchRightNeighbor, type DockLease } from './dock.js'
+import type { PanelInput, PanelInputEvent } from '../scrcpy-host.js'
 
 const NS = 'dsh-android-pane'
 const API = '/_dsh/dsh-android-pane'
@@ -240,8 +241,9 @@ interface DeviceRow {
   mode: 'h264' | 'poll' | null
 }
 
-async function api<T = Rec>(path: string, body?: Rec): Promise<T> {
+async function api<T = Rec>(path: string, body?: Rec, options: RequestInit = {}): Promise<T> {
   const res = await fetch(API + path, {
+    ...options,
     method: body == null ? 'GET' : 'POST',
     headers: { 'content-type': 'application/json' },
     body: body == null ? undefined : JSON.stringify(body),
@@ -544,8 +546,14 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
   private imgRef: HTMLImageElement | null = null
   private frameCount = 0
   private frameTotal = 0
-  private pointer: { x: number; y: number; t: number } | null = null
+  private pointer: { x: number; y: number; lastX: number; lastY: number; t: number; pointerId: number; serial: string; gesture: string; w: number; h: number; realtime: boolean } | null = null
   private gestureMoved = false
+  private inputQueue: Array<{ serial: string; input: PanelInput }> = []
+  private inputInflight = false
+  private inputRaf = 0
+  private holdTimer: ReturnType<typeof setInterval> | null = null
+  private screenRef: HTMLDivElement | null = null
+  private unmounted = false
   private lastReattachAt = 0
   private h264Retries = 0
   private pref: PanePref = 'auto'
@@ -579,6 +587,7 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
       if (e.key === 'Escape' && this.state.open) this.setOpen(false)
     }
     window.addEventListener('keydown', this.onKeyDown)
+    window.addEventListener('pagehide', this.clearGesture)
     void this.poll()
   }
 
@@ -591,10 +600,13 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
   }
 
   componentWillUnmount(): void {
+    this.unmounted = true
+    window.removeEventListener('pagehide', this.clearGesture)
     if (this.pollTimer != null) clearInterval(this.pollTimer)
     if (this.fpsTimer != null) clearInterval(this.fpsTimer)
     if (this.secLumTimer != null) clearInterval(this.secLumTimer)
     this.stopStream()
+    this.bindScreen(null)
     this.releaseLease()
     this.magCleanup?.()
     this.removeToggle()
@@ -770,6 +782,7 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
   }
 
   private stopStream(): void {
+    this.clearGesture()
     this.stream?.stop()
     this.stream = null
     if (this.pollImgTimer != null) {
@@ -783,6 +796,7 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
   private attachSeq = 0
 
   private async attach(serial: string, retried = false): Promise<void> {
+    this.clearGesture()
     const seq = ++this.attachSeq
     const stale = (): boolean => seq !== this.attachSeq
     this.setState({ error: null })
@@ -808,6 +822,7 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
             if (this.frameTotal > 5) this.h264Retries = 0 // 稳定出帧 → 重置重连预算
           },
           (meta) => {
+            if (this.canvasRef?.width !== meta.w || this.canvasRef?.height !== meta.h) this.clearGesture()
             this.setState({ streamSize: { w: meta.w, h: meta.h } })
             const c = this.canvasRef
             if (c != null) {
@@ -819,6 +834,7 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
           },
           (reason) => {
             if (stale()) return // 旧代 reader 的死亡事件不污染新代状态
+            this.clearGesture()
             this.setState({ streamError: reason, mode: 'poll' })
             this.startPollImg()
             // 流被服务端旧流 teardown 竞态立即掐断（典型：页面刷新后 attach 撞上重建窗口）：
@@ -892,44 +908,156 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
     }
   }
 
+  /** One queue preserves touch/wheel order; only MOVE and adjacent scroll are coalesced. */
+  private queueInput(context: { serial: string; gesture: string; w: number; h: number }, event: PanelInputEvent): void {
+    let batch = this.inputQueue.at(-1)
+    if (batch?.serial !== context.serial || batch.input.gesture !== context.gesture || batch.input.events.length >= 64) {
+      batch = { serial: context.serial, input: { gesture: context.gesture, w: context.w, h: context.h, events: [] } }
+      this.inputQueue.push(batch)
+    }
+    const last = batch.input.events.at(-1)
+    if (last?.p === 'move' && event.p === 'move') Object.assign(last, event)
+    else if (last?.p === 'scroll' && event.p === 'scroll' && Math.abs(last.dx! + event.dx!) <= 15 && Math.abs(last.dy! + event.dy!) <= 15) {
+      last.x = event.x; last.y = event.y
+      last.dx! += event.dx!; last.dy! += event.dy!
+    } else batch.input.events.push(event)
+    if (event.p === 'down' || event.p === 'up') this.flushRealtime()
+    else if (this.inputRaf === 0) this.inputRaf = requestAnimationFrame(this.flushRealtime)
+  }
+
+  private flushRealtime = (): void => {
+    if (this.inputRaf !== 0) cancelAnimationFrame(this.inputRaf)
+    this.inputRaf = 0
+    if (this.inputInflight) return
+    const batch = this.inputQueue.shift()
+    if (batch == null) return
+    this.inputInflight = true
+    void api('/act', { serial: batch.serial, action: 'input', input: batch.input }, { keepalive: true, signal: AbortSignal.timeout(2000) })
+      .catch(e => {
+        // An uncertain DOWN must never be replayed. Cancel, report, then require a new gesture.
+        this.inputQueue = []
+        this.pointer = null
+        this.stopHoldTimer()
+        if (!this.unmounted) this.setState({ error: 'Panel input: ' + String(e instanceof Error ? e.message : e) })
+        void api('/act', { serial: batch.serial, action: 'input', input: { ...batch.input, events: [{ p: 'up', x: 0, y: 0 }] } },
+          { keepalive: true, signal: AbortSignal.timeout(2000) }).catch(e => console.warn('Panel release failed; host timeout will release', e))
+      })
+      .finally(() => { this.inputInflight = false; this.flushRealtime() })
+  }
+
+  private stopHoldTimer(): void {
+    if (this.holdTimer != null) clearInterval(this.holdTimer)
+    this.holdTimer = null
+  }
+
+  private clearGesture = (): void => {
+    const p = this.pointer
+    this.pointer = null
+    this.stopHoldTimer()
+    // Discard unsent DOWN/MOVE (including completed queued taps) on close/switch/cancel.
+    const cancelled = this.inputQueue
+    this.inputQueue = []
+    const releases = new Map<string, { serial: string; gesture: string; w: number; h: number; x: number; y: number }>()
+    for (const batch of cancelled) {
+      const last = batch.input.events.at(-1)!
+      if (last.p !== 'scroll') releases.set(batch.input.gesture, { serial: batch.serial, ...batch.input, x: last.x, y: last.y })
+    }
+    if (p?.realtime) releases.set(p.gesture, { ...p, x: p.lastX, y: p.lastY })
+    for (const ctx of releases.values()) this.queueInput(ctx, { p: 'up', x: ctx.x, y: ctx.y })
+  }
+
   private onPointerDown = (e: RPointerEvent): void => {
-    if (this.state.busy) return
-    const p = this.canvasPoint(e)
-    if (p == null) return
-    this.pointer = { ...p, t: Date.now() }
+    if (this.state.busy || this.state.claimSessionId != null || this.pointer != null || e.button !== 0 || !e.isPrimary || this.state.serial == null) return
+    if (e.target !== this.canvasRef && e.target !== this.imgRef) return
+    // ponytail: at most 8 queued gesture batches; a stalled transport cancels after 2s.
+    if (this.inputQueue.length >= 8) { this.setState({ error: 'Panel input queue busy' }); return }
+    const point = this.canvasPoint(e)
+    if (point == null) return
+    const el = this.canvasRef ?? this.imgRef
+    const p = { ...point, lastX: point.x, lastY: point.y, t: Date.now(), pointerId: e.pointerId,
+      serial: this.state.serial, gesture: crypto.randomUUID(), w: el instanceof HTMLCanvasElement ? el.width : el!.naturalWidth,
+      h: el instanceof HTMLCanvasElement ? el.height : el!.naturalHeight, realtime: this.state.mode === 'h264' }
+    this.pointer = p
     this.gestureMoved = false
+    e.currentTarget.setPointerCapture(e.pointerId)
+    if (!p.realtime) return
+    this.queueInput(p, { p: 'down', ...point })
+    this.holdTimer = setInterval(() => {
+      if (this.pointer === p) this.queueInput(p, { p: 'move', x: p.lastX, y: p.lastY })
+    }, 750)
   }
 
   private onPointerMove = (e: RPointerEvent): void => {
-    if (this.pointer == null) return
-    const p = this.canvasPoint(e)
-    if (p == null) return
-    if (Math.abs(p.x - this.pointer.x) + Math.abs(p.y - this.pointer.y) > 10) this.gestureMoved = true
-    // 拖拽预览不需要逐帧注入：抬起时合成 swipe（简化且省电量）
-  }
-
-  private onPointerUp = (e: RPointerEvent): void => {
-    if (this.pointer == null) return
-    const p = this.canvasPoint(e)
     const start = this.pointer
-    this.pointer = null
-    if (p == null) return
-    const held = Date.now() - start.t
-    if (this.gestureMoved) {
-      void this.act({ action: 'swipe', x: start.x, y: start.y, x2: p.x, y2: p.y, durationMs: Math.min(1200, Math.max(120, held)) })
-    } else if (held > 600) {
-      // 长按：同坐标 swipe（down-move-up 序列 ≈ Android 长按，弹出上下文菜单等）
-      void this.act({ action: 'swipe', x: start.x, y: start.y, x2: start.x, y2: start.y, durationMs: Math.min(900, held) })
-    } else {
-      void this.act({ action: 'tap', x: p.x, y: p.y })
+    if (start == null || e.pointerId !== start.pointerId) return
+    const point = this.canvasPoint(e)
+    if (point == null) return
+    if (Math.abs(point.x - start.x) + Math.abs(point.y - start.y) > 10) this.gestureMoved = true
+    start.lastX = point.x; start.lastY = point.y
+    if (start.realtime) {
+      if (this.state.mode !== 'h264' || this.state.serial !== start.serial || this.canvasRef?.width !== start.w || this.canvasRef?.height !== start.h) {
+        this.clearGesture(); return
+      }
+      this.queueInput(start, { p: 'move', ...point })
     }
   }
 
+  private onPointerUp = (e: RPointerEvent): void => {
+    const start = this.pointer
+    if (start == null || e.pointerId !== start.pointerId) return
+    const point = this.canvasPoint(e) ?? { x: start.lastX, y: start.lastY }
+    this.pointer = null
+    this.stopHoldTimer()
+    if (start.realtime) this.queueInput(start, { p: 'up', ...point })
+    else if (start.serial === this.state.serial) {
+      const held = Date.now() - start.t
+      if (this.gestureMoved) void this.act({ action: 'swipe', x: start.x, y: start.y, x2: point.x, y2: point.y, durationMs: Math.min(1200, Math.max(120, held)) })
+      else if (held > 600) void this.act({ action: 'swipe', x: start.x, y: start.y, x2: start.x, y2: start.y, durationMs: Math.min(900, held) })
+      else void this.act({ action: 'tap', ...point })
+    }
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId)
+  }
+
+  private onPointerCancel = (e: RPointerEvent): void => {
+    if (this.pointer?.pointerId === e.pointerId) this.clearGesture()
+  }
+
+  private onWheelNative = (e: WheelEvent): void => {
+    if (this.state.mode !== 'h264' || this.state.busy || this.state.claimSessionId != null || this.pointer != null || this.state.serial == null) return
+    const point = this.canvasPoint(e)
+    const canvas = this.canvasRef
+    if (point == null || canvas == null || e.target !== canvas) return
+    e.preventDefault()
+    const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? canvas.getBoundingClientRect().height : 1
+    // Calibration: 100 CSS pixels per step; split large wheel deltas without losing their sum.
+    let dx = -e.deltaX * unit / 100, dy = -e.deltaY * unit / 100
+    if (!Number.isFinite(dx) || !Number.isFinite(dy) || Math.abs(dx) > 128 || Math.abs(dy) > 128) {
+      this.setState({ error: 'Panel wheel delta out of range' }); return
+    }
+    do {
+      const sx = Math.max(-15, Math.min(15, dx)), sy = Math.max(-15, Math.min(15, dy))
+      this.queueInput({ serial: this.state.serial, gesture: 'wheel', w: canvas.width, h: canvas.height },
+        { p: 'scroll', ...point, dx: sx, dy: sy })
+      dx -= sx; dy -= sy
+    } while (dx !== 0 || dy !== 0)
+  }
+
+  private bindScreen = (el: HTMLDivElement | null): void => {
+    this.screenRef?.removeEventListener('wheel', this.onWheelNative)
+    this.screenRef = el
+    el?.addEventListener('wheel', this.onWheelNative, { passive: false })
+  }
+
   private async forceRelease(): Promise<void> {
-    if (this.state.serial == null) return
+    const serial = this.state.serial
+    if (serial == null) return
     try {
-      const r = await api<{ released: boolean; note: string }>('/claim/release', { serial: this.state.serial })
+      const r = await api<{ released: boolean; note: string }>('/claim/release', { serial })
+      if (this.state.serial !== serial) return
+      this.clearGesture()
       this.setState({ claimSessionId: null, note: r.note })
+      // Releasing a claim stops its stream; reconnect before accepting live input.
+      if (r.released) await this.attach(serial)
       setTimeout(() => this.setState({ note: null }), 6000)
     } catch (e) {
       this.setState({ error: String(e instanceof Error ? e.message : e).slice(0, 200) })
@@ -1193,7 +1321,9 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
         'div',
         {
           className: 'dap-screen',
+          ref: this.bindScreen as unknown as (el: HTMLDivElement | null) => void,
           onPointerDown: this.onPointerDown, onPointerMove: this.onPointerMove, onPointerUp: this.onPointerUp,
+          onPointerCancel: this.onPointerCancel, onLostPointerCapture: this.onPointerCancel,
         },
         this.state.secView === 'outline' && this.state.outline != null
           ? h('div', { className: 'dap-outline' },

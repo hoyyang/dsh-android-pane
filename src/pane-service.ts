@@ -13,7 +13,7 @@ import { createWriteStream, mkdirSync, readFileSync, writeFileSync, type WriteSt
 import { dirname, join } from 'node:path'
 import { Adb, isEmulatorSerial, type AdbDevice } from './adb.js'
 import { PaneStateStore, type QualityPrefs } from './state.js'
-import { ACTION_DOWN, ACTION_MOVE, ACTION_UP, StreamSession } from './scrcpy-host.js'
+import { ACTION_DOWN, ACTION_MOVE, ACTION_UP, StreamSession, parsePanelInput } from './scrcpy-host.js'
 import { extractSecureState, HINT_DISABLE_FLAG_SECURE, type MitigateResult, type MitigateStep, type SecureFocus } from './flag-secure.js'
 
 export interface DebugSegment {
@@ -306,6 +306,7 @@ export class PaneHub {
     }
 
     // 首次授权：走到这里的 attach 已经过 DSH 工具审批（或用户面板手动操作），记住设备
+    this.streams.get(s)?.cancelPanelTouch()
     this.state.trust(s)
 
     // 亮屏 + 解锁键盘（连接即点亮——熄屏/锁屏会让一切交互无效，实测教训）
@@ -329,6 +330,7 @@ export class PaneHub {
     const size: { w: number; h: number } | null = meta != null ? { w: meta.streamWidth, h: meta.streamHeight } : null
     const deviceName: string | null = meta?.deviceName || null
 
+    this.streams.get(s)?.cancelPanelTouch()
     const claimedAt = existing?.claimedAt ?? Date.now()
     this.claims.set(s, { serial: s, sessionId, claimedAt, lastActivityAt: Date.now() })
     this.seenDetached.delete(s)
@@ -741,6 +743,17 @@ export class PaneHub {
   async actPanel(req: ActRequest, signal?: AbortSignal): Promise<{ serial: string; performed: string }> {
     const serial = req.serial
     if (serial == null || serial === '') throw new Error('面板操作需要 serial')
+    this.assertPanelAvailable(serial)
+    // 自愈（同 agent act 路径 B2 教训——人点面板同样需要）：流不在时先尝试恢复，避免静默掉 adb 慢路径
+    if (this.streams.get(serial)?.running !== true) {
+      await this.ensureStream(serial, signal).catch(() => undefined)
+    }
+    this.assertPanelAvailable(serial) // Recheck after asynchronous stream recovery.
+    const performed = await this.performAct(serial, req, signal, 'panel')
+    return { serial, performed }
+  }
+
+  private assertPanelAvailable(serial: string): void {
     const claim = this.claims.get(serial)
     if (claim != null) {
       const err = new Error(`设备已被智能体会话锁定（${claim.sessionId.slice(0, 8)}）——任务完成后自动释放；紧急接管请点面板「强制解锁」`) as Error & { code?: string }
@@ -753,11 +766,23 @@ export class PaneHub {
       err.code = 'agent-busy'
       throw err
     }
-    // 自愈（同 agent act 路径 B2 教训——人点面板同样需要）：流不在时先尝试恢复，避免静默掉 adb 慢路径
-    if (this.streams.get(serial)?.running !== true) {
-      await this.ensureStream(serial, signal).catch(() => undefined)
+  }
+
+  /** Panel input stays separate from agent act: no session header can bypass the human lock. */
+  panelInput(serial: string | undefined, raw: unknown): { serial: string; performed: string } {
+    if (serial == null || serial === '') throw Object.assign(new Error('Panel input requires serial'), { code: 'bad-request' })
+    const input = parsePanelInput(raw)
+    const stream = this.streams.get(serial)
+    if (input.events.every(e => e.p === 'up')) {
+      stream?.cancelPanelTouch(input.gesture)
+      return { serial, performed: 'input(released)' }
     }
-    const performed = await this.performAct(serial, req, signal, 'panel')
+    this.assertPanelAvailable(serial)
+    if (stream == null || !stream.running) throw Object.assign(new Error('Panel control stream unavailable; reconnect'), { code: 'no-stream' })
+    stream.injectPanelInput(input)
+    const dbg = this.debugSessions.get(this.debugBySerial.get(serial) ?? '')
+    const performed = 'input(' + input.events.map(e => e.p).join(',') + ')|ctl'
+    if (dbg != null && dbg.stoppedAt == null) dbg.acts.push({ t: Date.now(), action: 'input', detail: performed })
     return { serial, performed }
   }
 
@@ -795,12 +820,13 @@ export class PaneHub {
     if (via === 'agent' && dbg != null && dbg.stoppedAt == null && dbg.mode === 'human') {
       throw new Error('调试会话进行中（人操作模式）——AI 请勿注入干扰；如需接管先停止调试会话')
     }
-    const performed = await this.performActInner(s, req, signal)
+    if (via === 'agent') this.streams.get(s)?.cancelPanelTouch()
+    const performed = await this.performActInner(s, req, signal, via)
     if (dbg != null && dbg.stoppedAt == null) dbg.acts.push({ t: Date.now(), action: req.action, detail: performed })
     return performed
   }
 
-  private async performActInner(s: string, req: ActRequest, signal?: AbortSignal): Promise<string> {
+  private async performActInner(s: string, req: ActRequest, signal?: AbortSignal, via: 'agent' | 'panel' = 'agent'): Promise<string> {
     const stream = this.streams.get(s)
     const h264 = stream != null && stream.running
     switch (req.action) {
@@ -811,7 +837,7 @@ export class PaneHub {
           stream!.injectTouch(x, y, ACTION_DOWN)
           stream!.injectTouch(x, y, ACTION_UP)
         } else {
-          const p = this.adbPoint(s, x, y)
+          const p = via === 'panel' ? this.adbPoint(s, x, y) : { x, y }
           await this.adb.shellOk(s, `input tap ${p.x} ${p.y}`, { signal, timeoutMs: 10_000 })
         }
         return `tap(${x},${y})${PaneHub.TOUCH_VIA_CONTROL && h264 ? '|ctl' : '|adb'}`
@@ -825,8 +851,8 @@ export class PaneHub {
         if (PaneHub.TOUCH_VIA_CONTROL && h264) {
           await stream!.injectSwipe(x1, y1, x2, y2, dur)
         } else {
-          const p1 = this.adbPoint(s, x1, y1)
-          const p2 = this.adbPoint(s, x2, y2)
+          const p1 = via === 'panel' ? this.adbPoint(s, x1, y1) : { x: x1, y: y1 }
+          const p2 = via === 'panel' ? this.adbPoint(s, x2, y2) : { x: x2, y: y2 }
           await this.adb.shellOk(s, `input swipe ${p1.x} ${p1.y} ${p2.x} ${p2.y} ${dur}`, { signal, timeoutMs: 12_000 })
         }
         return `swipe(${x1},${y1}→${x2},${y2},${dur}ms)${PaneHub.TOUCH_VIA_CONTROL && h264 ? '|ctl' : '|adb'}`
@@ -863,8 +889,17 @@ export class PaneHub {
         const x = Math.round(req.x ?? 0)
         const y = Math.round(req.y ?? 0)
         const dy = req.y2 != null ? Math.round(req.y2) : -1
-        if (h264) stream!.scroll(x, y, 0, dy)
-        else await this.adb.shellOk(s, `input swipe ${x} ${y} ${x} ${y + dy * 400} 300`, { signal, timeoutMs: 10_000 })
+        if (h264) {
+          const meta = stream!.info
+          const dim = stream!.displayDim
+          // Tools use display pixels; scrcpy scroll uses the encoded frame space.
+          const sx = via === 'agent' && meta != null ? x * meta.streamWidth / dim.w : x
+          const sy = via === 'agent' && meta != null ? y * meta.streamHeight / dim.h : y
+          stream!.scroll(sx, sy, 0, dy)
+        } else {
+          const p = via === 'panel' ? this.adbPoint(s, x, y) : { x, y }
+          await this.adb.shellOk(s, `input swipe ${p.x} ${p.y} ${p.x} ${p.y + dy * 400} 300`, { signal, timeoutMs: 10_000 })
+        }
         return `scroll(${x},${y},dy=${dy})`
       }
       case 'back':
