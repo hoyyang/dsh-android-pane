@@ -12,6 +12,65 @@ export interface DockLease {
   release(): void
 }
 
+/** 右侧邻列：dsh-project-manager 的卡片详情列（body 上的 fixed 右列，right:0）。
+ *  面板要贴在它左边，四列才排成「会话 | 右侧边栏 | 面板 | 卡片详情」。
+ *  认的是类名 —— 对方改名/不存在 = 恒返回 0 = 面板退回贴最右（功能不坏，只是会被详情盖住）。 */
+const NEIGHBOR_SEL = '.dpm-global-detail'
+
+/** 盯邻列，把「面板右边缘应让出的距离」回调出去；返回取消函数。
+ *  详情开/关、拖宽、隐藏（data-dpm-gd="away"）、窗口缩放都实时跟随（事件驱动，不轮询）。 */
+export function watchRightNeighbor(apply: (rightPx: number) => void): () => void {
+  let det: HTMLElement | null = null
+  let ro: ResizeObserver | null = null
+  let attrs: MutationObserver | null = null
+  let raf = 0
+  let dead = false
+  const measure = (): number => {
+    if (det == null || det.hidden || det.getAttribute('data-dpm-gd') === 'away') return 0
+    const r = det.getBoundingClientRect()
+    // 已移出视口 / 没宽度 = 没占位，让出 0
+    if (r.width <= 0 || r.left >= window.innerWidth) return 0
+    return Math.max(0, Math.round(window.innerWidth - r.left))
+  }
+  const run = (): void => {
+    raf = 0
+    if (!dead) apply(measure())
+  }
+  const soon = (): void => {
+    if (!dead && raf === 0) raf = requestAnimationFrame(run)
+  }
+  /** 详情列懒创建（首次打开详情才 append 到 body）→ body 直接子节点变化就重新认一次。 */
+  const bind = (): void => {
+    const next = document.querySelector<HTMLElement>(NEIGHBOR_SEL)
+    if (next === det) {
+      soon()
+      return
+    }
+    ro?.disconnect()
+    attrs?.disconnect()
+    det = next
+    if (det != null) {
+      ro = new ResizeObserver(soon)
+      ro.observe(det)
+      attrs = new MutationObserver(soon)
+      attrs.observe(det, { attributes: true, attributeFilter: ['style', 'hidden', 'data-dpm-gd'] })
+    }
+    soon()
+  }
+  const bodyMo = new MutationObserver(bind)
+  bodyMo.observe(document.body, { childList: true })
+  window.addEventListener('resize', soon)
+  bind()
+  return () => {
+    dead = true
+    bodyMo.disconnect()
+    ro?.disconnect()
+    attrs?.disconnect()
+    window.removeEventListener('resize', soon)
+    if (raf !== 0) cancelAnimationFrame(raf)
+  }
+}
+
 export function claimRootDock(
   root: HTMLElement,
   owner: string,

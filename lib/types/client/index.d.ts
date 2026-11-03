@@ -81,6 +81,8 @@ interface PaneWindowState {
         w: number;
         h: number;
     } | null;
+    /** 停靠形态：右侧邻列（卡片详情页）占掉的宽度 —— 面板右边缘让位，排在它左边 */
+    dockRight: number;
 }
 export declare class PaneWindow extends Component<Record<string, never>, PaneWindowState> {
     state: PaneWindowState;
@@ -100,6 +102,7 @@ export declare class PaneWindow extends Component<Record<string, never>, PaneWin
     private h264Retries;
     private pref;
     private lease;
+    private unwatchNeighbor;
     private magEl;
     private magCleanup;
     componentDidMount(): void;
@@ -112,6 +115,9 @@ export declare class PaneWindow extends Component<Record<string, never>, PaneWin
     /** 停靠租约生命周期：开面板时按 pref/窗宽决定形态；claim 失败（他人持租约/窄窗）→ 浮窗降级。 */
     private syncForm;
     private releaseLease;
+    /** 停靠时盯右侧邻列（dsh-project-manager 的卡片详情列）：面板右边缘 = 它左边缘。 */
+    private startNeighborWatch;
+    private stopNeighborWatch;
     private toggleForm;
     private poll;
     private dispatchState;

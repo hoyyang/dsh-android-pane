@@ -9,7 +9,7 @@
  */
 import { createElement as h, Component, useState, useEffect } from 'react'
 import type { PointerEvent as RPointerEvent, ChangeEvent as RChangeEvent } from 'react'
-import { claimRootDock, DAP_DOCK_OWNER, type DockLease } from './dock.js'
+import { claimRootDock, DAP_DOCK_OWNER, watchRightNeighbor, type DockLease } from './dock.js'
 
 const NS = 'dsh-android-pane'
 const API = '/_dsh/dsh-android-pane'
@@ -107,7 +107,7 @@ const PANE_CSS = `
   --dap-hf:'Fredoka','Noto Sans SC',system-ui,sans-serif;
   --dap-spring:cubic-bezier(.34,1.56,.64,1);
   font-family:var(--dap-hf);color:var(--dap-ink);display:flex;flex-direction:column;gap:10px}
-.dap-dock{position:fixed;top:0;right:0;bottom:0;width:420px;z-index:60;padding:14px;
+.dap-dock{position:fixed;top:0;right:0;bottom:0;width:420px;box-sizing:border-box;z-index:60;padding:14px;
   background:var(--dap-bg);border-left:2px solid var(--dap-ink);
   box-shadow:-6px 0 24px rgba(58,49,40,.18)}
 .dap-overlay{position:fixed;right:16px;bottom:72px;width:400px;max-height:82vh;z-index:99990;padding:12px;
@@ -502,6 +502,8 @@ interface PaneWindowState {
   secCanvasVisible: boolean
   /** 流尺寸（meta 帧）：canvas 重挂载（大纲切回画面）时恢复正确长宽，B22g */
   streamSize: { w: number; h: number } | null
+  /** 停靠形态：右侧邻列（卡片详情页）占掉的宽度 —— 面板右边缘让位，排在它左边 */
+  dockRight: number
 }
 
 let openCount = 0
@@ -530,6 +532,7 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
     outline: null,
     secCanvasVisible: false,
     streamSize: null,
+    dockRight: 0,
   }
   private pollTimer: ReturnType<typeof setInterval> | null = null
   private secLumTimer: ReturnType<typeof setInterval> | null = null
@@ -547,6 +550,7 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
   private h264Retries = 0
   private pref: PanePref = 'auto'
   private lease: DockLease | null = null
+  private unwatchNeighbor: (() => void) | null = null
   private magEl: HTMLDivElement | null = null
   private magCleanup: (() => void) | null = null
 
@@ -629,6 +633,7 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
         this.releaseLease()
         this.lease = lease
         lease.update(DOCK_W)
+        this.startNeighborWatch()
         if (this.state.form !== 'dock') this.setState({ form: 'dock' })
         return
       }
@@ -640,6 +645,21 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
   private releaseLease(): void {
     this.lease?.release()
     this.lease = null
+    this.stopNeighborWatch()
+  }
+
+  /** 停靠时盯右侧邻列（dsh-project-manager 的卡片详情列）：面板右边缘 = 它左边缘。 */
+  private startNeighborWatch(): void {
+    if (this.unwatchNeighbor != null) return
+    this.unwatchNeighbor = watchRightNeighbor((px) => {
+      if (px !== this.state.dockRight) this.setState({ dockRight: px })
+    })
+  }
+
+  private stopNeighborWatch(): void {
+    this.unwatchNeighbor?.()
+    this.unwatchNeighbor = null
+    if (this.state.dockRight !== 0) this.setState({ dockRight: 0 })
   }
 
   private toggleForm(): void {
@@ -1115,6 +1135,8 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
         className: `dap-pane ${docked ? 'dap-dock' : 'dap-overlay'}`,
         role: 'complementary',
         'aria-label': 'Android 设备面板',
+        // 停靠时给右侧邻列（卡片详情页）让位：四列排成「会话 | 右侧边栏 | 面板 | 详情」
+        style: docked && this.state.dockRight > 0 ? { right: `${this.state.dockRight}px` } : undefined,
       },
       // 头部：贴纸标题 + 设备菜单 + 形态切换 + 关闭
       h(

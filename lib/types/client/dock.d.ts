@@ -10,4 +10,7 @@ export interface DockLease {
     update(width: number): void;
     release(): void;
 }
+/** 盯邻列，把「面板右边缘应让出的距离」回调出去；返回取消函数。
+ *  详情开/关、拖宽、隐藏（data-dpm-gd="away"）、窗口缩放都实时跟随（事件驱动，不轮询）。 */
+export declare function watchRightNeighbor(apply: (rightPx: number) => void): () => void;
 export declare function claimRootDock(root: HTMLElement, owner: string, width: number, computedMarginRight?: number): DockLease | undefined;
