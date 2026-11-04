@@ -37,6 +37,7 @@ export interface PendingCapture {
         remote: string;
         startEpoch: number;
         endEpoch?: number;
+        clock?: DebugClock;
     }>;
     actions?: Array<{
         t: number;

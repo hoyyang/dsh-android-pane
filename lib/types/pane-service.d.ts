@@ -20,6 +20,8 @@ export interface DebugSegment {
     error?: string;
     startEpoch: number;
     endEpoch?: number;
+    /** Clock bound sampled at this segment's start: still valid when the device clock steps between rotations. */
+    clock?: DebugClock;
 }
 export interface DebugAct {
     t: number;

@@ -24,6 +24,8 @@ export interface DebugSegment {
   error?: string
   startEpoch: number
   endEpoch?: number
+  /** Clock bound sampled at this segment's start: still valid when the device clock steps between rotations. */
+  clock?: DebugClock
 }
 export interface DebugAct {
   t: number
@@ -1510,7 +1512,7 @@ export class PaneHub {
     this.persistDebug(sess)
     this.debugSessions.set(id, sess)
     this.debugBySerial.set(serial, id)
-    try { this.debugSpawnSegment(sess); this.debugSpawnLogcat(sess) }
+    try { await this.debugSpawnSegment(sess); this.debugSpawnLogcat(sess) }
     catch (e) { sess.error = String(e); void this.debugStop(serial).catch(err => this.opts.log('调试启动失败：' + String(err))); throw e }
     if (signal != null) {
       const abort = () => { void this.debugStop(serial).catch(e => this.opts.log('取消调试保存失败：' + String(e))) }
@@ -1531,10 +1533,13 @@ export class PaneHub {
     } catch (e) { this.opts.log('调试时间未校准（仍保留录屏与日志）：' + String(e)); return undefined }
   }
 
-  private debugSpawnSegment(sess: DebugSession): void {
+  private async debugSpawnSegment(sess: DebugSession): Promise<void> {
+    if (sess.stoppedAt != null || this.disposed) return
+    // Sample before spawning screenrecord: adb start-up traffic makes a concurrent sample miss its bound.
+    const clock = await this.sampleDebugClock(sess.serial)
     if (sess.stoppedAt != null || this.disposed) return
     const remote = '/data/local/tmp/dsh_' + sess.id + '_' + sess.segIndex++ + '.mp4'
-    const seg: DebugSegment = { remote, startEpoch: Date.now() }
+    const seg: DebugSegment = { remote, startEpoch: Date.now(), ...(clock == null ? {} : { clock }) }
     sess.segments.push(seg)
     this.persistDebug(sess)
     const proc = this.spawnCapture(sess.serial, 'screenrecord ' + sess.captureOptions + '--time-limit 170 ' + remote)
@@ -1546,7 +1551,7 @@ export class PaneHub {
         if (sess.stoppedAt != null || this.disposed) return
         const info = this.captureProcesses.get(proc)!
         if (code !== 0 || seg.endEpoch - seg.startEpoch < 20_000) throw new Error('设备录屏提前退出：' + (info.error ?? info.stderr ?? String(code)))
-        this.debugSpawnSegment(sess)
+        void this.debugSpawnSegment(sess).catch(e => { sess.captureError = String(e instanceof Error ? e.message : e); void this.debugStop(sess.serial).catch(err => this.opts.log('调试异常停止：' + String(err))) })
       } catch (e) {
         sess.captureError = String(e instanceof Error ? e.message : e)
         void this.debugStop(sess.serial).catch(err => this.opts.log('调试异常停止：' + String(err)))
@@ -1693,9 +1698,11 @@ export class PaneHub {
     } catch (e) { throw new Error('无法准备取证帧目录：' + framesDir + '（' + (e instanceof Error ? e.message : String(e)) + '）') }
     const clock = debugClockBounds(sess.clockStart, sess.clockEnd)
     const frameIssues: string[] = []
-    if (!clock) frameIssues.push('设备/宿主时钟未校准或已漂移：仅返回视频采样，不能证明操作前后；日志切片不可对齐')
+    if (!clock) frameIssues.push(sess.segments.some(s => s.clock)
+      ? '会话起止时钟未校准或已漂移：日志切片不可对齐；帧改用各分段启动时的时钟采样'
+      : '设备/宿主时钟未校准或已漂移：仅返回视频采样，不能证明操作前后；日志切片不可对齐')
     if (sess.acts.length > 12) frameIssues.push('只分析最近 12 个操作；更早的 ' + (sess.acts.length - 12) + ' 个未取前后帧（完整时间线仍在上方）')
-    const sources: Array<{ seg: DebugSegment; pts: number[]; epochs?: number[] }> = []
+    const sources: Array<{ seg: DebugSegment; pts: number[]; epochs?: number[]; clock?: DebugClock }> = []
     for (const seg of sess.segments) {
       if (!seg.local) continue
       try {
@@ -1704,13 +1711,15 @@ export class PaneHub {
         if (!pts.length || pts.some((t, i) => !Number.isFinite(t) || (i > 0 && t <= pts[i - 1]!))) throw new Error('视频帧时间不可用')
         const source: typeof sources[number] = { seg, pts }
         sources.push(source)
-        if (clock) {
+        const segClock = seg.clock ?? clock
+        if (segClock != null) {
           const size = lstatSync(seg.local).size, fd = openSync(seg.local, 'r')
           // ponytail: native metadata must fit the final 1MB; stream-scan if future formats exceed it.
           const bytes = Buffer.alloc(Math.min(size, 1024 * 1024))
           try { if (readSync(fd, bytes, 0, bytes.length, size - bytes.length) !== bytes.length) throw new Error('元数据读取不完整') }
           finally { closeSync(fd) }
           source.epochs = nativeFrameEpochs(bytes, pts)
+          source.clock = segClock
         }
       } catch (e) { frameIssues.push((seg.local ?? seg.remote) + '：' + String(e)) }
     }
@@ -1720,8 +1729,8 @@ export class PaneHub {
       for (const tg of sess.acts.length ? [{ kind: 'pre' as const, epoch: w.t - 600 }, { kind: 'post' as const, epoch: (w.endedAt ?? w.t) + 1200 }] : [{ kind: 'sample' as const, epoch: w.t }]) {
         const source = sources.find(s => s.epochs && s.seg.startEpoch <= tg.epoch && tg.epoch <= (s.seg.endEpoch ?? stoppedAt))
         if (!source) { frameIssues.push(w.label + ' ' + tg.kind + '：该时刻不在已保存录屏段内（分段间隙或临近起止）'); continue }
-        if (!clock) continue
-        const index = selectDebugFrame(source.epochs!, clock, tg.epoch, tg.kind)
+        if (source.clock == null) continue
+        const index = selectDebugFrame(source.epochs!, source.clock, tg.epoch, tg.kind)
         if (index >= 0) { targets.push({ source, index, t: w.t, label: w.label, kind: tg.kind, requestedAt: tg.epoch }); continue }
         if (tg.kind === 'pre') { frameIssues.push(w.label + ' pre：录屏早于该操作，没有可证明的"操作前"画面'); continue }
         // Sparse recordings only carry frames when the screen changes: no frame after the action is itself
@@ -1741,8 +1750,9 @@ export class PaneHub {
         // Decode/select the exact probed frame index: input seek would select the next sparse frame.
         await runMedia('ffmpeg', ['-v', 'error', '-i', source.seg.local!, '-map', '0:v:0', '-vf', 'select=eq(n\\,' + index + ')', '-fps_mode', 'vfr', '-frames:v', '1', '-n', tmp])
         commitFrame(tmp, file)
-        const calibrated = source.epochs != null && clock != null
-        frames.push({ file, label: target.label, t: target.t, kind, pts: source.pts[index]!, requestedAt: target.requestedAt, timing: calibrated ? 'calibrated' : 'uncalibrated', ...(calibrated ? { frameAt: source.epochs![index]! + (clock!.minOffsetMs + clock!.maxOffsetMs) / 2, uncertaintyMs: (clock!.maxOffsetMs - clock!.minOffsetMs) / 2 } : {}) })
+        const sourceClock = source.clock
+        const calibrated = source.epochs != null && sourceClock != null
+        frames.push({ file, label: target.label, t: target.t, kind, pts: source.pts[index]!, requestedAt: target.requestedAt, timing: calibrated ? 'calibrated' : 'uncalibrated', ...(calibrated ? { frameAt: source.epochs![index]! + (sourceClock!.minOffsetMs + sourceClock!.maxOffsetMs) / 2, uncertaintyMs: (sourceClock!.maxOffsetMs - sourceClock!.minOffsetMs) / 2 } : {}) })
       } catch (e) { frameIssues.push(target.label + ' ' + kind + '：' + (e instanceof Error ? e.message : String(e)).split(tmp).join(file)) }
       finally { try { unlinkSync(tmp) } catch { /* Only this unique extraction's temporary file. */ } }
     }

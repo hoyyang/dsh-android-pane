@@ -32,15 +32,18 @@ export interface PendingCapture {
   logRemote?: string
   clockStart?: DebugClock
   clockEnd?: DebugClock
-  segments?: Array<{ remote: string; startEpoch: number; endEpoch?: number }>
+  segments?: Array<{ remote: string; startEpoch: number; endEpoch?: number; clock?: DebugClock }>
   actions?: Array<{ t: number; endedAt?: number; action: string; detail?: string }>
+}
+function validClock(clock: DebugClock | undefined): boolean {
+  return clock == null || (Number.isFinite(clock.minOffsetMs) && Number.isFinite(clock.maxOffsetMs) && clock.maxOffsetMs >= clock.minOffsetMs && clock.maxOffsetMs - clock.minOffsetMs <= MAX_CLOCK_WIDTH_MS)
 }
 function validPending(job: PendingCapture): boolean {
   if (!job || typeof job.id !== 'string' || !/^(record|dbg)-[0-9a-f-]{36}$/.test(job.id) || !['record', 'debug'].includes(job.type) || typeof job.serial !== 'string' || !job.serial || typeof job.dir !== 'string' || !isAbsolute(job.dir) || job.dir.includes('\0') || !Number.isFinite(job.startedAt)) return false
   if (job.stoppedAt != null && !Number.isFinite(job.stoppedAt)) return false
-  for (const clock of [job.clockStart, job.clockEnd]) if (clock != null && (!Number.isFinite(clock.minOffsetMs) || !Number.isFinite(clock.maxOffsetMs) || clock.maxOffsetMs < clock.minOffsetMs || clock.maxOffsetMs - clock.minOffsetMs > MAX_CLOCK_WIDTH_MS)) return false
+  if (!validClock(job.clockStart) || !validClock(job.clockEnd)) return false
   if (job.type === 'record') return job.remote === '/data/local/tmp/dsh_' + job.id + '.mp4'
-  return job.logRemote === '/data/local/tmp/dsh_' + job.id + '-logcat.log' && Array.isArray(job.segments) && job.segments.every((seg, i) => seg && seg.remote === '/data/local/tmp/dsh_' + job.id + '_' + i + '.mp4' && Number.isFinite(seg.startEpoch) && (seg.endEpoch == null || Number.isFinite(seg.endEpoch))) && Array.isArray(job.actions) && job.actions.every(a => a && Number.isFinite(a.t) && (a.endedAt == null || (Number.isFinite(a.endedAt) && a.endedAt >= a.t)) && typeof a.action === 'string' && (a.detail == null || typeof a.detail === 'string'))
+  return job.logRemote === '/data/local/tmp/dsh_' + job.id + '-logcat.log' && Array.isArray(job.segments) && job.segments.every((seg, i) => seg && seg.remote === '/data/local/tmp/dsh_' + job.id + '_' + i + '.mp4' && Number.isFinite(seg.startEpoch) && (seg.endEpoch == null || Number.isFinite(seg.endEpoch)) && validClock(seg.clock)) && Array.isArray(job.actions) && job.actions.every(a => a && Number.isFinite(a.t) && (a.endedAt == null || (Number.isFinite(a.endedAt) && a.endedAt >= a.t)) && typeof a.action === 'string' && (a.detail == null || typeof a.detail === 'string'))
 }
 export interface PaneState {
   trustedDevices: string[]

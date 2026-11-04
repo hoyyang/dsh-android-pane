@@ -131,6 +131,8 @@ try {
   const firstSegment = debug.recordProc, info = hub.captureProcesses.get(firstSegment)
   debug.segments[0].startEpoch = Date.now() - 171000
   info.done = true; info.close(0); firstSegment.emit('close', 0)
+  // Rotation now samples the device clock before spawning the next segment.
+  for (let i = 0; i < 100 && debug.segments.length < 2; i++) await new Promise(yes => setTimeout(yes, 20))
   assert.equal(debug.segments.length, 2) // Native finalization rotates immediately with bounded encoder dimensions.
   failPull = true
   const removedBefore = removed.length
@@ -267,12 +269,16 @@ try {
   const clockPending = width => ({ id: pendingId, type: 'debug', serial: 'device', dir: second, startedAt: Date.now(), logRemote: '/data/local/tmp/dsh_' + pendingId + '-logcat.log', segments: [], actions: [], clockStart: { minOffsetMs: -width / 2, maxOffsetMs: width / 2 } })
   clockState.upsertPending(clockPending(1000)) // Widest sample the sampler can produce must pass the validator.
   assert.throws(() => clockState.upsertPending(clockPending(1001)), /无效待保存采集清单/)
+  const segRemote = '/data/local/tmp/dsh_' + pendingId + '_0.mp4'
+  clockState.upsertPending({ ...clockPending(200), segments: [{ remote: segRemote, startEpoch: Date.now(), clock: { minOffsetMs: -500, maxOffsetMs: 500 } }] })
+  assert.throws(() => clockState.upsertPending({ ...clockPending(200), segments: [{ remote: segRemote, startEpoch: Date.now(), clock: { minOffsetMs: -600, maxOffsetMs: 401 } }] }), /无效待保存采集清单/)
   // The analyze pipeline itself: guard the exact behaviours a refactor could silently undo.
   const serviceSource = readFileSync(join(root, 'src', 'pane-service.ts'), 'utf8')
   assert.match(serviceSource, /commitFrame\(tmp, file\)/) // Only a committed fresh extraction may become evidence.
   assert.match(serviceSource, /select=eq\(n\\\\,'/) // Escaped comma must reach ffmpeg.
   assert.doesNotMatch(serviceSource, /'-y'/) // Never overwrite a stale deterministic frame.
   assert.match(serviceSource, /existsSync\(tmp\)/) // ffmpeg exit 0 without output is still a failure.
+  assert.match(serviceSource, /seg\.clock \?\? clock/) // Per-segment bounds win over the session-wide fallback.
   assert.match(serviceSource, /rmSync\(framesDir/) // Previous analyze output is cleared first.
   assert.match(serviceSource, /该时刻不在已保存录屏段内/) // Out-of-segment targets are reported, not dropped silently.
   let handler
