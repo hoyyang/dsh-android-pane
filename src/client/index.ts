@@ -452,6 +452,21 @@ interface PaneWindowState {
 
 let openCount = 0
 
+/**
+ * PM parity: prefer the same host directory picker project-manager drives
+ * (`uiWorkspace.pickDirectory`), and on DSH Desktop use its preload bridge
+ * (`__DSH_DIRECTORY_PICKER__.pick`) which opens the Electron folder dialog.
+ * Only when neither exists does the pane fall back to its own HTTP picker route.
+ */
+let hostPickDirectory: (() => Promise<{ handled: boolean; directory?: string | null }>) | null = null
+
+/** The composed picker can be browse-only (remote/browser setups); say that in user terms. */
+function friendlyPickerError(e: unknown): string {
+  const text = e instanceof Error ? e.message : String(e)
+  if (/native capability/.test(text) || /serves\s*"browse"/.test(text)) return '当前运行方式没有系统文件夹对话框（目录选择器为浏览模式）——请直接在输入框里填绝对路径。'
+  return text
+}
+
 export class PaneWindow extends Component<Record<string, never>, PaneWindowState> {
   state: PaneWindowState = {
     open: false,
@@ -1056,9 +1071,12 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
     const controller=new AbortController();this.directoryPicking=controller
     this.setState({directoryPickerOpen:true,directoryError:null})
     try {
-      const {directory}=await api<{directory:string|null}>('/capture/pick-directory',{}, {signal:controller.signal})
+      const viaHost=hostPickDirectory==null?{handled:false as const}:await hostPickDirectory()
+      let directory:string|null
+      if(viaHost.handled) directory=viaHost.directory??null
+      else ({directory}=await api<{directory:string|null}>('/capture/pick-directory',{}, {signal:controller.signal}))
       if(!controller.signal.aborted&&!this.unmounted&&this.state.modal==='directory'&&directory!==null)this.setState({directoryDraft:directory})
-    } catch(e) {if(!controller.signal.aborted&&!this.unmounted&&this.state.modal==='directory')this.setState({directoryError:e instanceof Error?e.message:String(e)})}
+    } catch(e) {if(!controller.signal.aborted&&!this.unmounted&&this.state.modal==='directory')this.setState({directoryError:friendlyPickerError(e)})}
     finally {this.directoryPicking=null;if(!this.unmounted)this.setState({directoryPickerOpen:false})}
   }
   private async saveDirectory():Promise<void> {
@@ -1326,6 +1344,18 @@ export function apply(ctx: { slots: { entries(slot:string):Array<{component:Reac
   // ③ 卸载即净：dispose 先停巡检/断观察器再摘标签，零残留
   upsertStyle(BTN_STYLE_ID, BTN_CSS)
   upsertStyle(PANE_STYLE_ID, PANE_CSS)
+  // Same two paths project-manager's repo picker uses: desktop preload bridge first, then uiWorkspace.
+  hostPickDirectory = async () => {
+    const bridge = (globalThis as { __DSH_DIRECTORY_PICKER__?: { pick?: () => Promise<string | null> } }).__DSH_DIRECTORY_PICKER__
+    if (bridge != null && typeof bridge.pick === 'function') return { handled: true, directory: await bridge.pick() }
+    let ui: { pickDirectory?: () => Promise<string | null> } | undefined
+    try { ui = (ctx as unknown as { uiWorkspace?: { pickDirectory?: () => Promise<string | null> } }).uiWorkspace } catch { ui = undefined }
+    if (ui?.pickDirectory == null) {
+      try { ui = (ctx as unknown as { get?: (name: string) => { pickDirectory?: () => Promise<string | null> } | undefined }).get?.('uiWorkspace') } catch { ui = undefined }
+    }
+    if (ui?.pickDirectory != null) return { handled: true, directory: await ui.pickDirectory() }
+    return { handled: false }
+  }
   ctx.effect(() => {
     const heal = (): void => {
       let healed = false
