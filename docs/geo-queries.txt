@@ -1,0 +1,8 @@
+安卓手机实时画面面板
+agent 操作安卓手机
+安卓 截图 保存 到电脑
+安卓 录屏 调试 日志 证据
+Android screen mirroring in chat
+Android device automation agent
+scrcpy panel for deepseek harness
+android ui tree tap coordinates
