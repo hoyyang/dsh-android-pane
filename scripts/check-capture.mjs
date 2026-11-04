@@ -316,12 +316,23 @@ try {
   res = await choose(); assert.equal(res.status,409)
   releasePick(null); assert.equal((await (await pendingPick).json()).directory,null)
   const client = readFileSync(join(root,'src/client/index.ts'),'utf8')
+  const hostPickerStart = client.indexOf('let hostPickDirectory')
+  const helper = client.slice(hostPickerStart, client.indexOf('export class PaneWindow'))
   const method = client.slice(client.indexOf('  private async browseDirectory()'),client.indexOf('  private async saveDirectory()'))
-  const cls = ts.transpileModule('class Picker {' + method + '} ', {compilerOptions:{target:ts.ScriptTarget.ES2023}}).outputText
+  const cls = ts.transpileModule(helper + '\nclass Picker {' + method + '}', {compilerOptions:{target:ts.ScriptTarget.ES2023}}).outputText
   let apiCalls=0, result=null
-  const Picker = new Function('api',cls+';return Picker')(async()=>{apiCalls++;if(result instanceof Error)throw result;return {directory:result}})
+  const built = new Function('api',cls+';return { Picker, setHostPick: v => { hostPickDirectory = v } }')(async()=>{apiCalls++;if(result instanceof Error)throw result;return {directory:result}})
+  const Picker = built.Picker
   const pane = new Picker(); pane.state={modal:'directory',directoryDraft:'/original',directoryPickerOpen:false};pane.setState=patch=>Object.assign(pane.state,patch)
-  await pane.browseDirectory();assert.equal(pane.state.directoryDraft,'/original')
+  // Host chain first: the desktop bridge / uiWorkspace result wins without touching the HTTP route.
+  built.setHostPick(async()=>({handled:true,directory:'/from-host'}))
+  await pane.browseDirectory();assert.equal(pane.state.directoryDraft,'/from-host');assert.equal(apiCalls,0)
+  built.setHostPick(async()=>({handled:true,directory:null})) // Cancelled picker: keep the draft.
+  await pane.browseDirectory();assert.equal(pane.state.directoryDraft,'/from-host')
+  built.setHostPick(async()=>{throw new Error('directoryPicker.pick needs the native capability; the composed picker serves \"browse\"')})
+  await pane.browseDirectory();assert.match(pane.state.directoryError,/没有系统文件夹对话框/)
+  built.setHostPick(null) // Legacy/unavailable service falls back to the pane's own route.
+  await pane.browseDirectory();assert.equal(pane.state.directoryDraft,'/from-host')
   result=second;await pane.browseDirectory();assert.equal(pane.state.directoryDraft,second);assert.equal(pane.state.directoryPickerOpen,false)
   result=new Error('failure');await pane.browseDirectory();assert.equal(pane.state.directoryError,'failure')
   const callsBefore=apiCalls;pane.state.capture={record:{status:'recording'}};await pane.browseDirectory();assert.equal(apiCalls,callsBefore)

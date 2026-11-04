@@ -20,9 +20,9 @@ dsh plugin add github:hoyyang/dsh-android-pane
 
 Zero configuration: no API keys, no DSH config edits. Requires `adb` on PATH (Android SDK), a device with USB debugging (or any emulator); macOS/Linux and the DSH web profile.
 
-### Development version 0.2.0: capture studio (unreleased)
+### 0.2.0: capture studio
 
-Screenshot / record / debug now save real files into one host directory: PNG for screenshots, MP4 for recordings, segmented MP4 + full logcat + action timeline (same prefix) for debug sessions. The pane keeps a full path bar at the top; settings use the host OS folder chooser (selection fills the draft, Save settings commits it; locked while capturing). Failures never report success and keep the device original plus a retry path, including switching directories; pending saves survive a host reload. Buttons turn into Stop with a timer in place, media mute/release replaces the old volume and rotate buttons, and Recent saves previews images and videos.
+Screenshot / record / debug now save real files into one host directory: PNG for screenshots, MP4 for recordings, segmented MP4 + full logcat + action timeline (same prefix) for debug sessions. The pane keeps a full path bar at the top; settings use the host directory-picker chain (Desktop bridge first, then uiWorkspace.pickDirectory — the same API project-manager uses; selection fills the draft, Save settings commits it; locked while capturing). Failures never report success and keep the device original plus a retry path, including switching directories; pending saves survive a host reload. Buttons turn into Stop with a timer in place, media mute/release replaces the old volume and rotate buttons, and Recent saves previews images and videos.
 
 ## Why it's useful
 
