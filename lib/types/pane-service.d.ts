@@ -98,7 +98,11 @@ export interface DebugAnalysis {
  * name, or a zero-byte "successful" decode, must never be reported as the requested frame.
  */
 export declare function commitFrame(tmp: string, file: string): void;
-/** Native screenrecord v2 maps monotonic nanoseconds to device wall time, not host spawn time. */
+/**
+ * Native screenrecord trailer layout (verified against 12 real segments): 16-byte tag, u32 version=2,
+ * i64 device wall clock at first frame in ns, u32 frame count, then i64 monotonic ns per frame.
+ * Maps monotonic nanoseconds to device wall time, not host spawn time.
+ */
 export declare function nativeFrameEpochs(bytes: Buffer, pts: number[]): number[];
 export declare function debugClockBounds(start?: DebugClock, end?: DebugClock): DebugClock | undefined;
 export declare function selectDebugFrame(epochs: number[], clock: DebugClock, target: number, kind: 'pre' | 'post' | 'sample'): number;

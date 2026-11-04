@@ -9,12 +9,12 @@
  *  - 隐私（规则8）：截图/录屏/调试写入宿主配置的绝对目录，路径透明。
  */
 import { spawn, type ChildProcess } from 'node:child_process'
-import { closeSync, openSync, readSync, createReadStream, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync, type WriteStream } from 'node:fs'
+import { closeSync, openSync, readSync, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync, type WriteStream } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { createInterface } from 'node:readline'
 import { dirname, join } from 'node:path'
 import { Adb, isEmulatorSerial, type AdbDevice } from './adb.js'
-import { PaneStateStore, validateCaptureDirectory, type QualityPrefs, type PendingCapture, type DebugClock } from './state.js'
+import { MAX_CLOCK_WIDTH_MS, PaneStateStore, validateCaptureDirectory, type QualityPrefs, type PendingCapture, type DebugClock } from './state.js'
 import { ACTION_DOWN, ACTION_MOVE, ACTION_UP, StreamSession, parsePanelInput } from './scrcpy-host.js'
 import { extractSecureState, HINT_DISABLE_FLAG_SECURE, type MitigateResult, type MitigateStep, type SecureFocus } from './flag-secure.js'
 
@@ -90,12 +90,18 @@ const PNG_SIG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
  * name, or a zero-byte "successful" decode, must never be reported as the requested frame.
  */
 export function commitFrame(tmp: string, file: string): void {
+  // ffmpeg exits 0 without writing when a select filter matches nothing.
+  if (!existsSync(tmp)) throw new Error('没有生成新的有效PNG')
   const png = readFileSync(tmp)
   if (png.length < 24 || !png.subarray(0, 8).equals(PNG_SIG)) throw new Error('没有生成新的有效PNG')
   renameSync(tmp, file)
 }
 
-/** Native screenrecord v2 maps monotonic nanoseconds to device wall time, not host spawn time. */
+/**
+ * Native screenrecord trailer layout (verified against 12 real segments): 16-byte tag, u32 version=2,
+ * i64 device wall clock at first frame in ns, u32 frame count, then i64 monotonic ns per frame.
+ * Maps monotonic nanoseconds to device wall time, not host spawn time.
+ */
 export function nativeFrameEpochs(bytes: Buffer, pts: number[]): number[] {
   const at = bytes.indexOf('#VV1NSC0PET1ME2#')
   if (at < 0 || at + 32 > bytes.length || bytes.readUInt32LE(at + 16) !== 2) throw new Error('缺少受支持的原生帧时间元数据')
@@ -1519,7 +1525,7 @@ export class PaneHub {
       const before = Date.now()
       const out = (await this.adb.runOk(['-s', serial, 'shell', 'date', '+%s%N'], { signal, timeoutMs: 2000 })).trim()
       const after = Date.now()
-      if (!/^\d{19}$/.test(out) || after < before || after - before > 1000) throw new Error('设备时钟精度或往返时间不可用')
+      if (!/^\d{19}$/.test(out) || after < before || after - before > MAX_CLOCK_WIDTH_MS - 2) throw new Error('设备时钟精度或往返时间不可用')
       const deviceMs = Number(BigInt(out)) / 1e6
       return { minOffsetMs: before - deviceMs - 1, maxOffsetMs: after - deviceMs + 1 }
     } catch (e) { this.opts.log('调试时间未校准（仍保留录屏与日志）：' + String(e)); return undefined }
@@ -1669,16 +1675,26 @@ export class PaneHub {
             t: sess.startedAt + Math.round((durationMs * (i + 1)) / (Math.min(8, Math.max(3, Math.floor(durationMs / 6000))) + 1)),
             label: `采样${i + 1}`,
           }))
-    const framesDir = join(sess.dir, sess.id + '-frames')
-    mkdirSync(framesDir, { recursive: true })
     const { execFile } = await import('node:child_process')
     const runMedia = (bin: string, args: string[]): Promise<string> =>
       new Promise((resolve, reject) => {
         execFile(bin, args, { timeout: 20_000, maxBuffer: 16 * 1024 * 1024 }, (err, out) => err == null ? resolve(String(out)) : reject(err))
       })
+    // Declared dependency of analyze, not of the pane itself: fail before touching any saved segment.
+    for (const bin of ['ffmpeg', 'ffprobe']) {
+      try { await runMedia(bin, ['-version']) }
+      catch { throw new Error('调试分析需要 ' + bin + '（macOS: brew install ffmpeg；Ubuntu: apt install ffmpeg）') }
+    }
+    const framesDir = join(sess.dir, sess.id + '-frames')
+    try {
+      // Stale frames from a previous analyze of this session must never read as today's evidence.
+      rmSync(framesDir, { recursive: true, force: true })
+      mkdirSync(framesDir, { recursive: true })
+    } catch (e) { throw new Error('无法准备取证帧目录：' + framesDir + '（' + (e instanceof Error ? e.message : String(e)) + '）') }
     const clock = debugClockBounds(sess.clockStart, sess.clockEnd)
     const frameIssues: string[] = []
     if (!clock) frameIssues.push('设备/宿主时钟未校准或已漂移：仅返回视频采样，不能证明操作前后；日志切片不可对齐')
+    if (sess.acts.length > 12) frameIssues.push('只分析最近 12 个操作；更早的 ' + (sess.acts.length - 12) + ' 个未取前后帧（完整时间线仍在上方）')
     const sources: Array<{ seg: DebugSegment; pts: number[]; epochs?: number[] }> = []
     for (const seg of sess.segments) {
       if (!seg.local) continue
@@ -1703,7 +1719,8 @@ export class PaneHub {
     for (const w of windows) {
       for (const tg of sess.acts.length ? [{ kind: 'pre' as const, epoch: w.t - 600 }, { kind: 'post' as const, epoch: (w.endedAt ?? w.t) + 1200 }] : [{ kind: 'sample' as const, epoch: w.t }]) {
         const source = sources.find(s => s.epochs && s.seg.startEpoch <= tg.epoch && tg.epoch <= (s.seg.endEpoch ?? stoppedAt))
-        if (!source || !clock) continue
+        if (!source) { frameIssues.push(w.label + ' ' + tg.kind + '：该时刻不在已保存录屏段内（分段间隙或临近起止）'); continue }
+        if (!clock) continue
         const index = selectDebugFrame(source.epochs!, clock, tg.epoch, tg.kind)
         if (index >= 0) { targets.push({ source, index, t: w.t, label: w.label, kind: tg.kind, requestedAt: tg.epoch }); continue }
         if (tg.kind === 'pre') { frameIssues.push(w.label + ' pre：录屏早于该操作，没有可证明的"操作前"画面'); continue }
@@ -1726,7 +1743,7 @@ export class PaneHub {
         commitFrame(tmp, file)
         const calibrated = source.epochs != null && clock != null
         frames.push({ file, label: target.label, t: target.t, kind, pts: source.pts[index]!, requestedAt: target.requestedAt, timing: calibrated ? 'calibrated' : 'uncalibrated', ...(calibrated ? { frameAt: source.epochs![index]! + (clock!.minOffsetMs + clock!.maxOffsetMs) / 2, uncertaintyMs: (clock!.maxOffsetMs - clock!.minOffsetMs) / 2 } : {}) })
-      } catch (e) { frameIssues.push(target.label + ' ' + kind + '：' + String(e)) }
+      } catch (e) { frameIssues.push(target.label + ' ' + kind + '：' + (e instanceof Error ? e.message : String(e)).split(tmp).join(file)) }
       finally { try { unlinkSync(tmp) } catch { /* Only this unique extraction's temporary file. */ } }
     }
     // logcat 切片：内存保留最后 ~24MB，完整未过滤日志已保存到 errFile。

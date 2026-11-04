@@ -18,6 +18,8 @@ export interface DebugClock {
     minOffsetMs: number;
     maxOffsetMs: number;
 }
+/** One sampler round trip may bound the offset to ±1ms; both sides enforce this same ceiling. */
+export declare const MAX_CLOCK_WIDTH_MS = 1000;
 export interface PendingCapture {
     id: string;
     type: 'record' | 'debug';

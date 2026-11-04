@@ -45,6 +45,7 @@ dsh plugin add github:hoyyang/dsh-android-pane
 
 ## 进阶用法
 
+- **调试取证依赖**：`analyze` 抽帧需要宿主有 `ffmpeg` / `ffprobe`（macOS `brew install ffmpeg`，Ubuntu `apt install ffmpeg`）；缺失时直接报缺哪个，不会静默返回空帧。
 - **中文输入**：`android_pane_install_ime`（一次性装 ADBKeyboard 输入法，中文经剪贴板粘贴）。
 - **元素级操作**：`android_pane_ui` 按 find/click/setText，文本模糊匹配控件，替代盲点坐标。
 - **安全页面检测开关**：config `flagSecureCheck`（默认 true）。

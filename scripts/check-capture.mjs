@@ -259,6 +259,22 @@ try {
   commitFrame(fresh, stale)
   assert.equal(readFileSync(stale).length, png.length + 3)
   assert.equal(existsSync(fresh), false)
+  // Sampler and persistence share one clock-width ceiling: a valid sample must always be savable.
+  const clockHome = join(temp, 'clock-home'); mkdirSync(clockHome)
+  const clockState = PaneStateStore.open(clockHome)
+  clockState.setDirectory(second)
+  const pendingId = 'dbg-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+  const clockPending = width => ({ id: pendingId, type: 'debug', serial: 'device', dir: second, startedAt: Date.now(), logRemote: '/data/local/tmp/dsh_' + pendingId + '-logcat.log', segments: [], actions: [], clockStart: { minOffsetMs: -width / 2, maxOffsetMs: width / 2 } })
+  clockState.upsertPending(clockPending(1000)) // Widest sample the sampler can produce must pass the validator.
+  assert.throws(() => clockState.upsertPending(clockPending(1001)), /无效待保存采集清单/)
+  // The analyze pipeline itself: guard the exact behaviours a refactor could silently undo.
+  const serviceSource = readFileSync(join(root, 'src', 'pane-service.ts'), 'utf8')
+  assert.match(serviceSource, /commitFrame\(tmp, file\)/) // Only a committed fresh extraction may become evidence.
+  assert.match(serviceSource, /select=eq\(n\\\\,'/) // Escaped comma must reach ffmpeg.
+  assert.doesNotMatch(serviceSource, /'-y'/) // Never overwrite a stale deterministic frame.
+  assert.match(serviceSource, /existsSync\(tmp\)/) // ffmpeg exit 0 without output is still a failure.
+  assert.match(serviceSource, /rmSync\(framesDir/) // Previous analyze output is cleared first.
+  assert.match(serviceSource, /该时刻不在已保存录屏段内/) // Out-of-segment targets are reported, not dropped silently.
   let handler
   let pickResult = null, pickCalls = 0, pickPending = null
   const unmountRoutes = mountPaneRoutes({ register: route => { handler = route.handler; return () => {} } }, hub, () => null, async signal => {

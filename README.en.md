@@ -45,6 +45,7 @@ Screenshot / record / debug now save real files into one host directory: PNG for
 
 ## Advanced
 
+- **Debug evidence dependency**: `analyze` needs `ffmpeg` / `ffprobe` on the host (macOS `brew install ffmpeg`, Ubuntu `apt install ffmpeg`); a missing binary is named explicitly instead of returning empty frames.
 - **Chinese input**: `android_pane_install_ime` (one-time ADBKeyboard IME setup; Chinese text goes through clipboard paste).
 - **Element-level ops**: `android_pane_ui` find/click/setText — fuzzy text matching instead of blind coordinates.
 - **Secure-page detection switch**: config `flagSecureCheck` (default true).
