@@ -1,8 +1,7 @@
 {
-  "name": "@dsh-external/dsh-android-pane",
+  "name": "dsh-android-pane",
   "version": "0.2.1",
   "description": "Android 安卓设备实时画面面板：scrcpy 真机/模拟器 H.264 串流进 DSH 对话，agent 可点按操作并用截图与控件树自证，截图录屏调试证据存到电脑目录",
-  "private": true,
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/types/index.d.ts",
@@ -77,5 +76,8 @@
       ],
       "platform": "web"
     }
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

@@ -92,7 +92,7 @@ Zero configuration: no API keys, no DSH config edits. Requires `adb` on PATH (An
 - **Recent saves**: the bottom folder button previews images and videos.
 - **Debug analysis**: stop a debug session, then analyze for frames and log slices.
 - **Retry saving**: keep the pending record and retry with a writable directory.
-- **Uninstall**: `dsh plugin remove @dsh-external/dsh-android-pane`; state lives in `<DSH_HOME>/dsh-android-pane/`.
+- **Uninstall**: `dsh plugin remove dsh-android-pane`; state lives in `<DSH_HOME>/dsh-android-pane/`.
 
 ## Comparison
 
@@ -144,7 +144,7 @@ npm test
 ## Uninstall
 
 ```sh
-dsh plugin remove @dsh-external/dsh-android-pane
+dsh plugin remove dsh-android-pane
 ```
 
 Uninstalling stops the stream and reaps adb children; state lives in `<DSH_HOME>/dsh-android-pane/`.

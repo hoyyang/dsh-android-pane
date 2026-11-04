@@ -4,4 +4,4 @@
 # 开发期可由 super-injector 热注入（dev_inject_plugin）；重启后由 profile bundles 层装配。
 - insert:
     - id: dsh-android-pane
-      name: '@dsh-external/dsh-android-pane'
+      name: 'dsh-android-pane'

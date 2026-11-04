@@ -165,7 +165,7 @@ typecheck-ok
 - **最近保存**：底部文件夹按钮打开记录，可预览图片与视频。
 - **调试分析**：停止调试后调用 analyze，拿逐动作前后帧与日志切片。
 - **保存失败重试**：停止失败时面板保留待保存记录，换一个可写目录再点重试。
-- **卸载**：`dsh plugin remove @dsh-external/dsh-android-pane`，状态在 `<DSH_HOME>/dsh-android-pane/`，可整目录删除。
+- **卸载**：`dsh plugin remove dsh-android-pane`，状态在 `<DSH_HOME>/dsh-android-pane/`，可整目录删除。
 
 ## 与同类对比
 
@@ -219,7 +219,7 @@ npm test
 ## 卸载
 
 ```sh
-dsh plugin remove @dsh-external/dsh-android-pane
+dsh plugin remove dsh-android-pane
 ```
 
 卸载即停流、回收 adb 子进程；状态在 `<DSH_HOME>/dsh-android-pane/`，可整目录删除。

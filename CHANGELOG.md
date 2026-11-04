@@ -6,6 +6,10 @@
 
 - 统一保存目录弹窗的实心主按钮（「保存设置」/确认类按钮）悬停时落进通用 hover 的深色底，深色文字几乎不可读。现在实心按钮悬停保持浅底深字，并补了一条样式回归断言。
 
+### Changed
+
+- **包名去作用域并发布 npm**：@dsh-external/dsh-android-pane → dsh-android-pane，已发布 dsh-android-pane@0.2.1（npm i dsh-android-pane / dsh plugin add dsh-android-pane）。同步改了 cordis.patch.yml 的 entry name、tsdown.config.ts 的 PLUGIN_ID、README 中英；HTTP 路由前缀 /_dsh/dsh-android-pane、客户端命名空间与 <DSH_HOME>/dsh-android-pane/ 状态目录保持不变。
+
 ## 0.2.0 (2026-11-04)
 
 ### Changed
