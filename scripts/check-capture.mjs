@@ -316,6 +316,8 @@ try {
   res = await choose(); assert.equal(res.status,409)
   releasePick(null); assert.equal((await (await pendingPick).json()).directory,null)
   const client = readFileSync(join(root,'src/client/index.ts'),'utf8')
+  // Solid primary buttons must not inherit the generic dark hover background (unreadable dark-on-dark).
+  assert.match(client, /\.dap-dialog \.dap-primary:hover:not\(:disabled\)/)
   const hostPickerStart = client.indexOf('let hostPickDirectory')
   const helper = client.slice(hostPickerStart, client.indexOf('export class PaneWindow'))
   const method = client.slice(client.indexOf('  private async browseDirectory()'),client.indexOf('  private async saveDirectory()'))

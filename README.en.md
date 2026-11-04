@@ -96,7 +96,7 @@ Zero configuration: no API keys, no DSH config edits. Requires `adb` on PATH (An
 
 ## Comparison
 
-| Capability | dsh-android-pane 0.2.0 | scrcpy 5.x | scrcpy-mcp | mobile-mcp |
+| Capability | dsh-android-pane 0.2.1 | scrcpy 5.x | scrcpy-mcp | mobile-mcp |
 |---|---|---|---|---|
 | Embedded DSH pane (dock/floating) | yes | no (own window) | no | no |
 | H.264 live streaming | yes | yes | yes | yes |

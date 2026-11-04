@@ -169,7 +169,7 @@ typecheck-ok
 
 ## 与同类对比
 
-| 能力 | dsh-android-pane 0.2.0 | scrcpy 5.x | scrcpy-mcp | mobile-mcp |
+| 能力 | dsh-android-pane 0.2.1 | scrcpy 5.x | scrcpy-mcp | mobile-mcp |
 |---|---|---|---|---|
 | DSH 内嵌面板（右侧列/浮窗） | 有 | 无（独立窗口） | 无 | 无 |
 | H.264 实时串流 | 有 | 有 | 有 | 有 |
