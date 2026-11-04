@@ -27,7 +27,7 @@ const savedSignalTimeout = AbortSignal.timeout
 AbortSignal.timeout = () => new AbortController().signal
 const requests = []
 replace('fetch', (url, options) => {
-  assert(['/_dsh/dsh-android-pane/act', '/_dsh/dsh-android-pane/claim/release'].includes(url), 'Only mocked input/release requests are allowed')
+  assert(['/_dsh/dsh-android-pane/act', '/_dsh/dsh-android-pane/claim/release', '/_dsh/dsh-android-pane/capture/pick-directory'].includes(url), 'Only mocked input/release/picker requests are allowed')
   let resolve, reject
   const promise = new Promise((yes, no) => { resolve = yes; reject = no })
   requests.push({ body: JSON.parse(options.body), options, resolve, reject })
@@ -224,7 +224,8 @@ try {
 
   const hub = Object.create(PaneHub.prototype)
   Object.assign(hub, { streams: new Map(), claims: new Map(), busyUntil: new Map(),
-    debugSessions: new Map(), debugBySerial: new Map(), lastDims: new Map() })
+    debugSessions: new Map(), debugBySerial: new Map(), lastDims: new Map(),
+    state: { upsertPending: job => assert(Array.isArray(job.actions), 'Input must persist its debug timeline') } })
   const serial = 'fake-device'
   const { stream, bytes } = streamMock()
   hub.streams.set(serial, stream)
@@ -305,7 +306,7 @@ try {
   }
   {
     const pane = paneMock(), start = requests.length, attached = []
-    pane.attach = async serial => attached.push(serial)
+    pane.attach = async serial => { assert.equal(pane.state.mode, null, 'Takeover cannot enable controls before reconnect'); attached.push(serial) }
     const release = pane.forceRelease()
     requests[start].resolve({ ok: true, json: async () => ({ ok: true, released: true, note: 'released' }) })
     await release
@@ -403,6 +404,44 @@ try {
     assert.equal(pane.inputInflight, false)
     groups++
   }
+  {
+    const pane = paneMock(), calls=[]
+    pane.state.open=true; pane.state.capture={directory:'/host',outputs:[],muted:{},record:{serial,status:'recording',startedAt:Date.now()},debug:null}
+    pane.captureInflight=true
+    let complete
+    pane.captureSettled=new Promise(resolve=>{complete=resolve})
+    pane.captureAction=async type=>{calls.push(type);return true}
+    pane.closeNow=()=>calls.push('closed')
+    pane.setOpen(false)
+    assert.equal(pane.state.modal,'confirm','In-flight screenshot must not discard close intent')
+    const closing=pane.confirmCallback()
+    await settle(); assert.deepEqual(calls,[],'Wait for screenshot before stopping capture')
+    pane.captureInflight=false;complete();await closing
+    assert.deepEqual(calls,['record','closed'])
+    // Close during an in-flight stop: it already saved, so do not stop a nonexistent debug job.
+    calls.length=0;pane.captureInflight=true
+    pane.captureSettled=new Promise(resolve=>{complete=resolve})
+    pane.setOpen(false);const afterStop=pane.confirmCallback()
+    pane.state.capture.record=null;pane.captureInflight=false;complete();await afterStop
+    assert.deepEqual(calls,['closed'])
+    groups++
+  }
+  {
+    const pane=paneMock()
+    Object.assign(pane.state,{open:true,devices:[{serial,state:'device'}],secure:{secure:true,captureVisible:true},capture:{directory:'/host',outputs:[],muted:{},record:null,debug:null}})
+    replace('document',{body:{nodeType:1}})
+    const walk=(node,fn)=>{if(!node||typeof node!=='object')return;fn(node);for(const child of [node.props?.children??node.children].flat(Infinity))walk(child,fn)}
+    const rendered=pane.render()
+    assert.equal(rendered.containerInfo,document.body,'Panel must escape host overlay stacking context')
+    const nodes=[];walk(rendered,n=>nodes.push(n))
+    assert(nodes.some(n=>n.type==='canvas'),'Authoritative visible capture must keep its canvas')
+    assert.equal(nodes.find(n=>n.props?.['data-dap-capture']==='screenshot').props.disabled,false)
+    assert.equal(nodes.find(n=>n.props?.['data-dap-capture']==='record').props.disabled,true,'screenrecord remains forbidden on a secure window')
+    pane.state.modal='settings';pane.state.claimSessionId='agent'
+    const settings=[];walk(pane.renderDialog(),n=>settings.push(n))
+    assert.equal(settings.find(n=>n.props?.['aria-label']==='画面质量').props.disabled,true)
+    groups++
+  }
   // A different in-flight gesture must not allow cancelled queued taps to inject later.
   {
     const pane = paneMock(), start = requests.length
@@ -480,6 +519,24 @@ try {
     }
     assert.equal(bytes.length, 0, 'Invalid remote scroll rejects the entire batch before DOWN')
     assert.equal(parsePanelInput(batch([event('scroll', 0, 0, { dx: 16, dy: -16 })])).events.length, 1)
+    groups++
+  }
+  // Native selection keeps the draft on cancel, and never opens an application browse page.
+  {
+    const pane=paneMock();Object.assign(pane.state,{modal:'directory',directoryDraft:'/old'})
+    let start=requests.length, pending=pane.browseDirectory()
+    assert.equal(pane.state.directoryPickerOpen,true);assert.equal(pane.renderDialog().type,'dialog')
+    await pane.browseDirectory();assert.equal(requests.length,start+1)
+    requests[start].resolve({ok:true,json:async()=>({ok:true,directory:null})});await pending
+    assert.equal(pane.state.directoryDraft,'/old');assert.equal(pane.state.directoryPickerOpen,false)
+    start=requests.length;pending=pane.browseDirectory()
+    requests[start].resolve({ok:true,json:async()=>({ok:true,directory:'/chosen'})});await pending
+    assert.equal(pane.state.directoryDraft,'/chosen')
+    start=requests.length;pending=pane.browseDirectory()
+    requests[start].reject(new Error('host failure'));await pending;assert.equal(pane.state.directoryError,'host failure')
+    start=requests.length;pending=pane.browseDirectory();pane.directoryPicking.abort()
+    requests[start].resolve({ok:true,json:async()=>({ok:true,directory:'/late'})});await pending
+    assert.equal(pane.state.directoryDraft,'/chosen');assert.equal(pane.state.directoryPickerOpen,false)
     groups++
   }
   assert.equal(spawnCalls, 0)

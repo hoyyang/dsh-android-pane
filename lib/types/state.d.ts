@@ -1,25 +1,74 @@
 export interface QualityPrefs {
-    /** 视频最大边长（0 = 原生分辨率） */
     maxSize: number;
     maxFps: number;
     videoBitRate: number;
 }
+export interface CaptureOutput {
+    id: string;
+    type: 'screenshot' | 'record' | 'debug';
+    files: string[];
+    at: number;
+    error?: string;
+    identities: Array<{
+        dev: number;
+        ino: number;
+    }>;
+}
+export interface DebugClock {
+    minOffsetMs: number;
+    maxOffsetMs: number;
+}
+export interface PendingCapture {
+    id: string;
+    type: 'record' | 'debug';
+    serial: string;
+    dir: string;
+    startedAt: number;
+    stoppedAt?: number;
+    error?: string;
+    captureError?: string;
+    remote?: string;
+    logRemote?: string;
+    clockStart?: DebugClock;
+    clockEnd?: DebugClock;
+    segments?: Array<{
+        remote: string;
+        startEpoch: number;
+        endEpoch?: number;
+    }>;
+    actions?: Array<{
+        t: number;
+        endedAt?: number;
+        action: string;
+        detail?: string;
+    }>;
+}
 export interface PaneState {
-    /** 已授权设备序列号（首次 attach 经 DSH 工具审批后记住） */
     trustedDevices: string[];
     quality: QualityPrefs;
     updatedAt: string;
+    directory: string;
+    outputs: CaptureOutput[];
+    pending: PendingCapture[];
+    volumeRestore: Record<string, number>;
 }
 export declare const DEFAULT_QUALITY: QualityPrefs;
+/** No relative/device/browser paths. Probe the actual host directory before committing a preference. */
+export declare function validateCaptureDirectory(directory: string): string;
 export declare class PaneStateStore {
     private readonly file;
     private cached;
     private constructor();
     static open(dir: string): PaneStateStore;
     get data(): Readonly<PaneState>;
+    reload(): Readonly<PaneState>;
     isTrusted(serial: string): boolean;
     trust(serial: string): void;
     untrust(serial: string): void;
     setQuality(patch: Partial<QualityPrefs>): QualityPrefs;
+    setDirectory(directory: string): string;
+    upsertPending(job: PendingCapture): void;
+    setVolumeRestore(serial: string, value?: number): void;
+    registerOutput(id: string, type: CaptureOutput['type'], files: string[], error?: string): void;
     private flush;
 }

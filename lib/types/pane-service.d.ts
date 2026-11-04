@@ -6,22 +6,24 @@
  *  - 闲置回收（规则4）：10 分钟无活动 → 释放认领 + 停流；模拟器额外 emu kill，真机仅断开；
  *  - 资源上限（规则7）：每会话 4 路、全局 8 路；
  *  - 降级（规则6/MVP）：scrcpy 启动失败 → 该设备进入 poll 模式（截图轮播），注入走 adb input；
- *  - 隐私（规则8）：截图只落 <dshHome>/dsh-android-pane/shots，路径透明。
+ *  - 隐私（规则8）：截图/录屏/调试写入宿主配置的绝对目录，路径透明。
  */
 import { type ChildProcess } from 'node:child_process';
 import { type WriteStream } from 'node:fs';
 import { Adb } from './adb.js';
-import { PaneStateStore, type QualityPrefs } from './state.js';
+import { PaneStateStore, type QualityPrefs, type DebugClock } from './state.js';
 import { StreamSession } from './scrcpy-host.js';
 import { type MitigateResult, type SecureFocus } from './flag-secure.js';
 export interface DebugSegment {
     remote: string;
     local?: string;
+    error?: string;
     startEpoch: number;
     endEpoch?: number;
 }
 export interface DebugAct {
     t: number;
+    endedAt?: number;
     action: string;
     detail?: string;
 }
@@ -39,10 +41,24 @@ export interface DebugSession {
     errFile: string;
     errStream: WriteStream | null;
     acts: DebugAct[];
+    pendingActions?: Set<Promise<void>>;
     segIndex: number;
     shortRotations: number;
     rotateTimer: NodeJS.Timeout | null;
     dir: string;
+    captureOptions: string;
+    clockStart?: DebugClock;
+    clockEnd?: DebugClock;
+    error?: string;
+    captureError?: string;
+    logRemote: string;
+    logLocal?: string;
+    saving?: Promise<{
+        id: string;
+        note: string;
+        summary?: DebugSummary;
+    }>;
+    saved?: boolean;
 }
 export interface DebugSummary {
     id: string;
@@ -64,13 +80,28 @@ export interface DebugAnalysis {
         label: string;
         t: number;
         kind: 'pre' | 'post' | 'sample';
+        pts: number;
+        requestedAt?: number;
+        frameAt?: number;
+        uncertaintyMs?: number;
+        timing: 'calibrated' | 'uncalibrated';
     }>;
+    frameIssues: string[];
     logSlices: string[];
     errorLines: string[];
     logTail: string[];
     mp4s: string[];
     errFile: string;
 }
+/**
+ * Only a frame written by this exact extraction may become evidence: a stale PNG at the same deterministic
+ * name, or a zero-byte "successful" decode, must never be reported as the requested frame.
+ */
+export declare function commitFrame(tmp: string, file: string): void;
+/** Native screenrecord v2 maps monotonic nanoseconds to device wall time, not host spawn time. */
+export declare function nativeFrameEpochs(bytes: Buffer, pts: number[]): number[];
+export declare function debugClockBounds(start?: DebugClock, end?: DebugClock): DebugClock | undefined;
+export declare function selectDebugFrame(epochs: number[], clock: DebugClock, target: number, kind: 'pre' | 'post' | 'sample'): number;
 export interface ClaimInfo {
     serial: string;
     sessionId: string;
@@ -89,6 +120,7 @@ export interface DeviceView {
 export interface ActRequest {
     action: 'tap' | 'swipe' | 'key' | 'text' | 'scroll' | 'back' | 'home' | 'recents' | 'volume_up' | 'volume_down' | 'rotate';
     serial?: string;
+    coordinateSpace?: 'stream' | 'physical';
     x?: number;
     y?: number;
     x2?: number;
@@ -110,6 +142,11 @@ export declare class PaneHub {
     private readonly busyUntil;
     private readonly pollSince;
     private readonly records;
+    private captureStarting;
+    private captureWrites;
+    private disposed;
+    private muteQueue;
+    private readonly captureProcesses;
     private readonly deviceInfo;
     /** attach 时切换到 ADBKeyboard 前的原输入法（detach 时还原） */
     private readonly prevIme;
@@ -136,6 +173,9 @@ export declare class PaneHub {
         flagSecureCheck: boolean;
         emulatorBin?: string;
     });
+    private persistRecord;
+    private persistDebug;
+    private stopRecoveredCapture;
     startTimers(): void;
     private refreshDevices;
     private ensureDevices;
@@ -268,7 +308,8 @@ export declare class PaneHub {
         installed: boolean;
         current: string;
     }>;
-    /** 中文等非 ASCII 文本：ADBKeyboard 已在 attach 时激活，直接广播注入。 */
+    private activateIme;
+    /** Input method must still be active; never report a broadcast to an inactive IME as typed text. */
     imeSend(s: string, text: string, signal?: AbortSignal): Promise<string>;
     /** 安装 ADBKeyboard.apk 并启用输入法（一次性设置；深度定制系统 会弹设备端确认）。 */
     installIme(serial: string, signal?: AbortSignal): Promise<{
@@ -278,6 +319,44 @@ export declare class PaneHub {
     /** 首个在线设备 serial。 */
     firstOnlineSerial(): string | null;
     rotate(s: string, signal?: AbortSignal): Promise<string>;
+    captureState(): {
+        directory: string;
+        record: {
+            error?: string | undefined;
+            serial: string;
+            startedAt: number;
+            stoppedAt: number | undefined;
+            status: "recording" | "pending-save";
+        } | null;
+        debug: {
+            error?: string | undefined;
+            id: string;
+            serial: string;
+            startedAt: number;
+            stoppedAt: number | undefined;
+            status: "recording" | "pending-save";
+        } | null;
+        outputs: {
+            id: string;
+            type: "screenshot" | "record" | "debug";
+            files: string[];
+            at: number;
+            error?: string;
+        }[];
+        muted: {
+            [k: string]: boolean;
+        };
+    };
+    private debugCapturing;
+    setCaptureDirectory(directory: string): void;
+    capturePanel(serial: string, type: 'screenshot' | 'record' | 'debug' | 'mute', action?: 'start' | 'stop'): Promise<void>;
+    private toggleMute;
+    captureFile(id: string, index: number): {
+        file: string;
+        dev: number;
+        ino: number;
+    };
+    private activeDirectory;
     saveScreenshot(serial: string, signal?: AbortSignal): Promise<string>;
     screenshotBuffer(serial: string, signal?: AbortSignal): Promise<Buffer>;
     /** uiautomator 结构化控件树（规则：验证闭环增强）。 */
@@ -289,7 +368,12 @@ export declare class PaneHub {
         center: [number, number];
         depth: number;
     }>>;
-    /** 停止录制并 pull 出 mp4（幂等）。 */
+    private nativeCaptureOptions;
+    /** Only generated remote paths enter this command; host directories never enter a shell. */
+    private spawnCapture;
+    private captureReady;
+    private stopCaptureProcess;
+    private pullCapture;
     private stopRecord;
     record(serial: string, action: 'start' | 'stop', outDir?: string, signal?: AbortSignal): Promise<{
         file?: string;
@@ -330,15 +414,14 @@ export declare class PaneHub {
     }>;
     private debugSessions;
     private debugBySerial;
-    debugStart(serial: string, mode: 'human' | 'agent', signal?: AbortSignal): {
+    debugStart(serial: string, mode: 'human' | 'agent', signal?: AbortSignal): Promise<{
         id: string;
         note: string;
-    };
+    }>;
+    private sampleDebugClock;
     private debugSpawnSegment;
-    /** 段轮转：杀当前 screenrecord（设备端自动落盘）→ 异步 pull → 拉起下一段。 */
-    private debugRotate;
-    private debugPullSegment;
     private debugSpawnLogcat;
+    private loadDebugLog;
     debugStop(serial: string): Promise<{
         id: string;
         note: string;

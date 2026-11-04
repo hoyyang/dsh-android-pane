@@ -231,7 +231,7 @@ export function registerPaneTools(
         if (action === 'list') return toJson({ sessions: hub.debugList() })
         if (action === 'analyze') return toJson(await hub.debugAnalyze(id))
         const s = hub.serialForSession(sessionIdOf(ctx), serial)
-        if (action === 'start') return toJson({ serial: s, ...hub.debugStart(s, 'agent', ctx.signal) })
+        if (action === 'start') return toJson({ serial: s, ...await hub.debugStart(s, 'agent', ctx.signal) })
         return toJson({ serial: s, ...(await hub.debugStop(s)) })
       },
       timeoutMs: 180_000,

@@ -15,4 +15,4 @@ export declare function mountPaneRoutes(webServer: {
         path: string;
         handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
     }): () => void;
-}, hub: PaneHub, sessionIdOf: (req: IncomingMessage) => string | null): () => void;
+}, hub: PaneHub, sessionIdOf: (req: IncomingMessage) => string | null, pickDirectory?: (signal: AbortSignal) => Promise<string | null>): () => void;

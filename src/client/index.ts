@@ -1,13 +1,13 @@
 /**
  * dsh-android-pane client：右侧停靠列（margin-right 租约）+ 浮窗降级 + 侧栏入口。
- * 风格：playful-pop × oat-terracotta（Style Studio 拍板 2026-09-04）——胖圆字、2px 描边、
- * 硬阴影 0 3px 0、果冻 hover、磁吸按钮（magnetic-btn）。跑马灯字带已按用户裁定移除。
+ * B28 Graphite Studio：画面优先，统一宿主目录，真实截图/录屏/调试。
  * 两必坑（骨架实测）：apply 用 ctx.slots 必须 export const inject = ['slots']；register 必带 name。
  * 流消费：fetch 流式分帧 [u32 type][u64 pts][u32 len][payload] → WebCodecs VideoDecoder(AnnexB) → canvas；
  * 降级：/stream 不可用（poll 模式）→ <img> 每 600ms 拉 /frame。
  * 手势：pointer 事件 → 设备物理坐标 → POST /act（agent 忙碌时 409 → 提示等徽标）。
  */
 import { createElement as h, Component, useState, useEffect } from 'react'
+import { createPortal } from 'react-dom'
 import type { PointerEvent as RPointerEvent, ChangeEvent as RChangeEvent } from 'react'
 import { claimRootDock, DAP_DOCK_OWNER, watchRightNeighbor, type DockLease } from './dock.js'
 import type { PanelInput, PanelInputEvent } from '../scrcpy-host.js'
@@ -69,7 +69,7 @@ const BTN_CSS = `
 /** B24 样式管理：内容即版本——与在册标签逐字比对，不一致原子换新（热重载后免整页刷新）。 */
 const BTN_STYLE_ID = 'dsh-android-pane-btn-css'
 const PANE_STYLE_ID = 'dsh-android-pane-pane-css'
-const CSS_VERSION = '0.1.1'
+const CSS_VERSION = '0.2.0'
 
 /** 挂载或换新样式标签；返回是否发生了实际写入。 */
 function upsertStyle(id: string, css: string): boolean {
@@ -100,112 +100,38 @@ function forceRemountStyle(id: string, css: string): void {
   upsertStyle(id, css)
 }
 
-/** 面板样式：playful-pop × oat-terracotta 令牌化（--dap-*），停靠列 + 浮窗双形态 + 三态 + 两标志性效果。 */
+/** B28 Graphite Studio: same tokens and compact controls as the confirmed prototype. */
 const PANE_CSS = `
-.dap-pane{
-  --dap-bg:#f2ede2;--dap-panel:#faf7ef;--dap-ink:#3a3128;--dap-muted:#6d6152;
-  --dap-accent:#8d4a2a;--dap-line:#e2dcc9;--dap-error:#b3402e;--dap-cream:#fdfbf5;
-  --dap-hf:'Fredoka','Noto Sans SC',system-ui,sans-serif;
-  --dap-spring:cubic-bezier(.34,1.56,.64,1);
-  font-family:var(--dap-hf);color:var(--dap-ink);display:flex;flex-direction:column;gap:10px}
-.dap-dock{position:fixed;top:0;right:0;bottom:0;width:420px;box-sizing:border-box;z-index:60;padding:14px;
-  background:var(--dap-bg);border-left:2px solid var(--dap-ink);
-  box-shadow:-6px 0 24px rgba(58,49,40,.18)}
-.dap-overlay{position:fixed;right:16px;bottom:72px;width:400px;max-height:82vh;z-index:99990;padding:12px;
-  background:var(--dap-bg);border:2px solid var(--dap-ink);border-radius:16px;
-  box-shadow:0 10px 34px rgba(0,0,0,.35),0 3px 0 var(--dap-ink)}
-.dap-head{display:flex;gap:8px;align-items:center;flex:none}
-.dap-title{font-weight:700;font-size:13px;letter-spacing:1px;background:var(--dap-panel);
-  border:2px solid var(--dap-ink);border-radius:10px;padding:3px 10px;box-shadow:0 3px 0 var(--dap-ink);
-  transform:rotate(-2deg);user-select:none;flex:none}
-.dap-select{flex:1;min-width:0;background:var(--dap-panel);border:2px solid var(--dap-ink);border-radius:10px;
-  padding:4px 8px;font:600 12px var(--dap-hf);color:var(--dap-ink)}
-.dap-btn2{display:inline-flex;align-items:center;justify-content:center;gap:4px;min-width:34px;height:30px;
-  padding:0 10px;border:2px solid var(--dap-ink);border-radius:12px;background:var(--dap-panel);color:var(--dap-ink);
-  font:700 12px var(--dap-hf);box-shadow:0 3px 0 var(--dap-ink);cursor:pointer;flex:none;
-  transition:transform .2s var(--dap-spring),box-shadow .2s ease;will-change:transform}
-.dap-btn2:hover{transform:scale(1.07)}
-.dap-btn2:active{transform:translateY(3px);box-shadow:0 0 0 var(--dap-ink);transition-duration:.06s}
-.dap-btn2.dap-accent{background:var(--dap-accent);color:var(--dap-cream)}
-.dap-btn2.dap-rec{background:var(--dap-error);color:#fff;border-color:var(--dap-ink)}
-.dap-busy{align-self:center;flex:none;background:var(--dap-panel);border:2px solid var(--dap-error);border-radius:999px;
-  padding:3px 14px;font:700 12px var(--dap-hf);color:var(--dap-error);box-shadow:0 3px 0 var(--dap-error);
-  transform:rotate(-1.5deg);animation:dap-busy-pulse 1.6s ease-in-out infinite}
-@keyframes dap-busy-pulse{0%,100%{transform:rotate(-1.5deg) scale(1)}50%{transform:rotate(-1.5deg) scale(1.05)}}
-.dap-screen{position:relative;flex:1;min-height:180px;background:var(--dap-ink);border:2px solid var(--dap-ink);
-  border-radius:16px;overflow:hidden;display:flex;align-items:center;justify-content:center}
-.dap-overlay .dap-screen{min-height:200px}
-.dap-screen canvas,.dap-screen img{max-width:100%;max-height:100%;display:block}
-.dap-overlay .dap-screen canvas,.dap-overlay .dap-screen img{max-height:46vh}
-.dap-state{display:flex;flex-direction:column;align-items:center;gap:10px;padding:18px;text-align:center}
-.dap-skel{width:70%;height:12px;border-radius:8px;
-  background:linear-gradient(90deg,#4a4036,#615444,#4a4036);background-size:200% 100%;
-  animation:dap-shimmer 1.2s ease-in-out infinite}
-.dap-skel.b{width:48%}.dap-skel.c{width:60%}
-@keyframes dap-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
-.dap-state-txt{font:700 13px var(--dap-hf);color:#efe9db}
-.dap-state-sub{font:500 11px/1.6 var(--dap-hf);color:#c9bfae;max-width:270px}
-.dap-errrow{display:flex;gap:8px;align-items:center;font:600 11px var(--dap-hf);color:var(--dap-error);
-  word-break:break-all;flex:none}
-.dap-errrow>span{flex:1}
-.dap-reconnect{display:flex;gap:8px;align-items:center;font:600 11px var(--dap-hf);
-  color:#a8842c;word-break:break-all;flex:none;animation:dap-reconnect-pulse 1.2s ease-in-out infinite}
-.dap-reconnect>span{flex:1}
-@keyframes dap-reconnect-pulse{0%,100%{opacity:.75}50%{opacity:1}}
-.dap-meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font:600 11px var(--dap-hf);color:var(--dap-muted);flex:none}
-.dap-meta .grow{flex:1}
-.dap-mini{background:var(--dap-panel);border:2px solid var(--dap-ink);border-radius:9px;
-  font:600 11px var(--dap-hf);color:var(--dap-ink);padding:2px 4px}
-.dap-note{font:500 10px/1.5 var(--dap-hf);color:var(--dap-muted);flex:none}
-.dap-note-hl{font:600 11px/1.5 var(--dap-hf);color:var(--dap-accent);flex:none}
-.dap-busy{display:flex;gap:8px;align-items:center;justify-content:center}
-.dap-unlock{margin-left:6px;background:var(--dap-error);color:#fff;border:none;border-radius:8px;
-  padding:2px 9px;font:700 11px var(--dap-hf);cursor:pointer}
-.dap-secrow{display:flex;gap:8px;align-items:center;flex:none;
-  background:repeating-linear-gradient(45deg,#3a2f1a,#3a2f1a 10px,#43371e 10px,#43371e 20px);
-  border:2px solid var(--dap-ink);border-radius:12px;padding:5px 10px;box-shadow:0 3px 0 var(--dap-ink)}
-.dap-sectext{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-  font:700 11.5px var(--dap-hf);color:#f3d98b;letter-spacing:.3px}
-.dap-secrow .dap-btn2{flex:none}
-.dap-secsteps{display:flex;flex-direction:column;gap:5px;flex:none;background:var(--dap-panel);
-  border:2px solid var(--dap-ink);border-radius:12px;padding:8px 10px;box-shadow:0 3px 0 var(--dap-ink)}
-.dap-step{display:flex;gap:7px;align-items:baseline;font:500 11px/1.5 var(--dap-hf)}
-.dap-st-ic{flex:none;width:16px;text-align:center;color:var(--dap-muted)}
-.dap-st-nm{flex:none;font-weight:700;color:var(--dap-accent);min-width:56px}
-.dap-st-dt{flex:1;color:var(--dap-muted);word-break:break-all}
-.dap-step.st-failed .dap-st-ic{color:var(--dap-error)}
-.dap-step.st-ok .dap-st-ic{color:#2e7d32}
-.dap-step.st-hint .dap-st-ic{color:#a8842c}
-.dap-outline{display:flex;flex-direction:column;width:100%;height:100%;min-height:180px;background:var(--dap-cream)}
-.dap-outline-hd{display:flex;gap:8px;align-items:center;flex:none;padding:8px 10px;
-  border-bottom:2px solid var(--dap-line);font:700 11px/1.5 var(--dap-hf);color:var(--dap-accent)}
-.dap-outline-hd span{flex:1;min-width:0}
-.dap-outline-list{flex:1;overflow:auto;padding:6px;display:flex;flex-direction:column;gap:4px;align-items:stretch}
-.dap-outline-item{display:flex;gap:6px;align-items:baseline;justify-content:space-between;
-  border:2px solid transparent;border-radius:9px;background:var(--dap-panel);padding:5px 8px;
-  font:500 11.5px/1.45 var(--dap-hf);color:var(--dap-ink);cursor:default;text-align:left;transition:transform .15s var(--dap-spring)}
-.dap-outline-item.ck{cursor:pointer;border-color:var(--dap-line)}
-.dap-outline-item.ck:hover{border-color:var(--dap-accent);transform:translateY(-1px)}
-.dap-ot{flex:1;min-width:0;word-break:break-all}
-.dap-oc{flex:none;font:500 9.5px var(--dap-hf);color:var(--dap-muted);opacity:.75}
-.dap-outline-empty{font:600 12px var(--dap-hf);color:var(--dap-muted);text-align:center;padding:14px}
-@media (prefers-reduced-motion:reduce){
-  .dap-busy,.dap-skel{animation:none!important}
-  .dap-btn2{transition:none}
-  .dap-btn2:hover,.dap-btn2:active{transform:none}
-}
+.dap-pane,.dap-dialog{color-scheme:dark;--bg:#101213;--panel:#191c1e;--raised:#25292c;--line:#383e42;--text:#f2f5f3;--muted:#b4bebc;--mint:#a8eed3;--amber:#ffd29a;--red:#ffb0ac;font:14px/1.5 "SF Pro Display","PingFang SC","Microsoft YaHei",sans-serif;color:var(--text);background:var(--panel)}
+.dap-pane{display:flex;flex-direction:column;min-height:0;overflow:hidden;box-sizing:border-box}
+.dap-pane *,.dap-dialog *{box-sizing:border-box}.dap-pane button,.dap-dialog button,.dap-dialog input,.dap-dialog select,.dap-select{font:inherit;color:inherit;outline-offset:3px}.dap-pane button,.dap-dialog button{cursor:pointer;transition:background .18s,border-color .18s,transform .18s}.dap-pane button:disabled,.dap-dialog button:disabled{cursor:not-allowed;opacity:.48}.dap-pane button:hover:not(:disabled),.dap-dialog button:hover:not(:disabled){border-color:#8b9793;background-color:#343b3a}.dap-pane button:active:not(:disabled),.dap-dialog button:active:not(:disabled){transform:translateY(1px)}.dap-pane :focus-visible,.dap-dialog :focus-visible{outline:2px solid var(--mint)}
+.dap-dock{position:fixed;top:0;right:0;bottom:0;width:420px;box-sizing:border-box;z-index:60;border-left:1px solid var(--line)}
+.dap-overlay{position:fixed;right:16px;top:8px;bottom:8px;width:440px;max-width:calc(100vw - 32px);z-index:99990;border:1px solid var(--line);border-radius:10px;box-shadow:0 10px 34px #0006}
+.dap-head{display:flex;align-items:center;gap:4px;padding:4px 8px;flex-shrink:0}.dap-select{flex:1;min-width:0;min-height:32px;background:transparent;border:0;font-size:12px}
+.dap-icon-svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.65;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
+.dap-icon{display:inline-flex;align-items:center;justify-content:center;width:32px;min-width:32px;height:32px;border:1px solid transparent;border-radius:6px;background:transparent;flex-shrink:0}
+.dap-btn2,.dap-quiet{display:inline-flex;align-items:center;justify-content:center;gap:4px;min-width:32px;min-height:32px;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:#222729;font-size:12px!important}
+.dap-primary{min-height:44px;padding:8px 18px;border:1px solid var(--mint);border-radius:10px;background:var(--mint);color:#12271e!important;font-weight:650}
+.dap-capture-zone{padding:0 8px 4px;flex-shrink:0}.dap-directory-row{display:flex;align-items:center;gap:6px;min-height:32px;margin-bottom:4px}.dap-directory-row>svg{color:var(--muted);width:16px}.dap-path{font:12px/1.4 "SFMono-Regular",Consolas,monospace;overflow-wrap:anywhere;word-break:break-word;white-space:pre-wrap}.dap-directory-row .dap-path{flex:1;min-width:0;max-height:min(3.4em,12vh);overflow:auto}
+.dap-capture-buttons{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.dap-capture-btn{position:relative;min-width:0;min-height:36px;display:flex;align-items:center;justify-content:center;gap:6px;padding:5px 6px;border:1px solid #48504d;border-radius:6px;background:#29302d}.dap-capture-btn b{font-size:13px;font-weight:600;white-space:nowrap}.dap-capture-btn small{font:11px monospace;color:var(--muted)}.dap-capture-btn small:empty{display:none}.dap-shot{border-color:#648a79;background:#293d33}.dap-shot svg{color:var(--mint)}.dap-record svg{color:var(--red)}.dap-debug{border-color:#77644b}.dap-debug svg{color:var(--amber)}.dap-capture-btn.active{background:#493128;border-color:var(--amber)}.dap-capture-btn.active:after{content:'';position:absolute;right:3px;top:3px;width:4px;height:4px;border-radius:50%;background:var(--red);animation:dap-indicator 1s infinite}
+.dap-screen{position:relative;flex:1;min-height:0;display:flex;align-items:center;justify-content:center;padding:4px;background:#111516;overflow:hidden;touch-action:none}.dap-screen canvas,.dap-screen img{display:block;max-width:100%;max-height:100%;flex-shrink:0;border:2px solid #363d39;border-radius:16px;object-fit:contain}.dap-screen.capturing canvas,.dap-screen.capturing img{border-color:#8b6a45}.dap-screen.flash:after{content:'';position:absolute;inset:4px;pointer-events:none;background:#fff;animation:dap-flash .35s forwards}
+.dap-navigation{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:4px 8px;border-top:1px solid var(--line);flex-shrink:0}.dap-nav-group{display:flex;gap:6px}.dap-mute[aria-pressed=true]{color:var(--mint);border-color:#779d8c;background:#273b31}.dap-text-entry{display:flex;gap:6px;padding:0 8px 6px;flex-shrink:0}.dap-text-entry input{background:#101617;border:1px solid #58605c;border-radius:6px;padding:6px;min-width:0;min-height:32px;flex:1;color:var(--text);font:12px inherit}
+.dap-state-banner{margin:4px 8px;padding:6px 8px;border:1px solid #836d4c;border-radius:6px;color:var(--amber);background:#332b21;font-size:12px;display:flex;gap:6px;align-items:center;flex-shrink:0}.dap-state-banner span{flex:1}.dap-toast{display:flex;align-items:center;gap:6px;flex-shrink:0;margin:0 8px 4px;padding:6px 8px;background:#2b4035;border:1px solid #85af99;border-radius:6px;font-size:12px}.dap-toast p{margin:0;flex:1;overflow-wrap:anywhere;max-height:12vh;overflow:auto}.dap-toast.error{background:#48302d;border-color:#bc8275}.dap-toast.error svg{color:var(--red)}
+.dap-state{display:flex;flex-direction:column;align-items:center;gap:10px;padding:18px;text-align:center}.dap-state-txt{font-size:17px;font-weight:600}.dap-state-sub{font-size:12px;line-height:1.8;color:var(--muted);max-width:270px}.dap-skel{width:70%;height:12px;border-radius:8px;background:linear-gradient(90deg,#25292c,#383e42,#25292c);background-size:200% 100%;animation:dap-shimmer 1.2s infinite}.dap-skel.b{width:48%}.dap-skel.c{width:60%}
+.dap-outline{display:flex;flex-direction:column;width:100%;height:100%;min-height:0}.dap-outline-hd{display:flex;gap:8px;align-items:center;padding:8px;font-size:12px;border-bottom:1px solid var(--line)}.dap-outline-hd span{flex:1}.dap-outline-list{flex:1;overflow:auto;display:flex;flex-direction:column;gap:4px;padding:6px}.dap-outline-item{display:flex;gap:6px;justify-content:space-between;text-align:left;border:1px solid var(--line);border-radius:6px;background:var(--panel);padding:5px 8px;min-height:32px;font-size:12px!important}.dap-ot{flex:1;min-width:0;overflow-wrap:anywhere}.dap-oc{font-size:10px;color:var(--muted)}
+.dap-dialog{width:420px;max-width:calc(100vw - 28px);max-height:calc(100dvh - 28px);padding:0;border:1px solid #68766e;border-radius:18px;box-shadow:0 24px 90px #0009}.dap-dialog::backdrop{background:#0009;backdrop-filter:blur(3px)}.dap-dialog[open]{animation:dap-enter .2s ease-out}.dap-dialog-head{display:flex;align-items:center;padding:16px 20px 12px;gap:12px}.dap-dialog-head h3{font-size:17px;font-weight:600;margin:0;flex:1}.dap-dialog-body{padding:0 20px 20px}.dap-dialog-body p{font-size:12px;color:var(--muted);margin:0 0 16px;line-height:1.8}.dap-dialog-body label{font-size:12px;display:block;margin-bottom:8px}.dap-dialog-body input,.dap-dialog-body select{width:100%;background:#111617;color:var(--text);border:1px solid #77857e;border-radius:9px;padding:10px 12px;min-height:44px}.dap-input-line{display:flex;gap:8px}.dap-input-line input{flex:1;min-width:0}.dap-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:20px}.dap-field-error{font-size:12px;color:var(--red);margin-top:8px;overflow-wrap:anywhere}.dap-setting-row{display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--line);font-size:13px}.dap-setting-row span{flex:1}.dap-setting-row select{width:145px;font-size:12px}.dap-output{padding:10px 0;border-top:1px solid var(--line)}.dap-output-top{display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:4px}.dap-output-top time{margin-left:auto;font-size:11px;color:var(--muted)}.dap-output-files{font-size:12px;color:var(--muted);line-height:1.6;overflow-wrap:anywhere}.dap-output-preview{color:var(--mint)!important;border:0;background:transparent;padding:4px 0;min-height:32px;text-align:left;font-size:12px!important}.dap-preview-media{display:block;max-width:100%;max-height:55vh;margin:0 auto 16px}.dap-log-preview{font:11px/1.7 monospace;white-space:pre-wrap;max-height:45vh;overflow:auto}
+@keyframes dap-flash{from{opacity:.8}to{opacity:0}}@keyframes dap-enter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}@keyframes dap-indicator{50%{opacity:.35}}@keyframes dap-shimmer{from{background-position:200% 0}to{background-position:-200% 0}}
+@media(max-width:999px){.dap-overlay{right:0;top:0;bottom:0;width:460px;max-width:100vw;border-radius:0}}
+@media(max-width:600px){.dap-overlay{width:100vw}}
+@media(pointer:coarse){.dap-pane .dap-icon,.dap-navigation .dap-btn2{min-width:44px;height:44px}.dap-select{min-height:44px}.dap-capture-btn{min-height:44px}.dap-navigation,.dap-nav-group{gap:4px}.dap-dialog-head .dap-icon,.dap-text-entry input,.dap-text-entry button,.dap-output-preview{min-height:44px}.dap-dialog-head .dap-icon{width:44px;height:44px}}
+@media(prefers-reduced-motion:reduce){.dap-pane *,.dap-pane *::before,.dap-pane *::after,.dap-dialog,.dap-dialog *{animation:none!important;transition:none!important;scroll-behavior:auto!important}.dap-screen.flash::after{display:none}.dap-dialog::backdrop{backdrop-filter:none}}
 `
 
-
-/** playful-pop 标题字体（Fredoka）——在线加载，失败静默回退 system-ui。 */
-function ensureFontLink(): void {
-  if (document.getElementById('dsh-android-pane-font-link') != null) return
-  const l = document.createElement('link')
-  l.id = 'dsh-android-pane-font-link'
-  l.rel = 'stylesheet'
-  l.href = 'https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Noto+Sans+SC:wght@500;700&display=swap'
-  document.head.appendChild(l)
+const ICON_PATHS: Record<string,string> = {
+ camera:'M4 6h4l2-3h4l2 3h4v15H4Z M16 13a4 4 0 1 1-8 0a4 4 0 1 1 8 0', video:'M3 5h13v14H3Z M16 10l5-3v10l-5-3Z', debug:'m8 8 4-4 4 4M7 12h10v6a5 5 0 0 1-10 0ZM12 12v10M3 10l4 3m10 0 4-3M3 18h4m10 0h4M6 22l2-2m8 0 2 2', folder:'M3 5h7l2 3h9v12H3Z', settings:'m8 3-1 3-3 1v4l2 1-2 2v4l3 1 1 3h8l1-3 3-1v-4l-2-2 2-1V7l-3-1-1-3Z M15 12a3 3 0 1 1-6 0a3 3 0 1 1 6 0', close:'m6 6 12 12M18 6 6 18', float:'M3 3h18v18H3Z M10 10h9v9h-9Z', refresh:'M20 8a8 8 0 1 0 0 8M20 3v5h-5', back:'m15 5-7 7 7 7', home:'M19 12a7 7 0 1 1-14 0a7 7 0 1 1 14 0', recents:'M5 5h14v14H5Z', mute:'M11 4 6 8H3v8h3l5 4ZM16 9l5 6m0-6-5 6', volume:'M11 4 6 8H3v8h3l5 4ZM16 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14', keyboard:'M2 5h20v14H2Z M6 9h1m4 0h1m4 0h1M6 13h1m4 0h1m4 0h1M8 16h8', check:'m5 12 4 4L19 6', lock:'M5 10h14v11H5Z M8 10V6a4 4 0 0 1 8 0v4M12 14v3', alert:'m12 3 10 18H2ZM12 9v5m0 3v1', stop:'M5 5h14v14H5Z',
 }
+function icon(name:string):ReturnType<typeof h> { return h('svg',{className:'dap-icon-svg',viewBox:'0 0 24 24','aria-hidden':true},h('path',{d:ICON_PATHS[name]??ICON_PATHS.alert})) }
+
 
 type Rec = Record<string, unknown>
 
@@ -479,6 +405,9 @@ const DOCK_W = 420
 const DOCK_MIN_W = 1200
 const PREF_KEY = 'dsh-android-pane:form'
 
+interface CaptureJob { serial:string; startedAt:number; status:'recording'|'pending-save'; error?:string; id?:string; stoppedAt?:number }
+interface CaptureOutput { id:string; type:'screenshot'|'record'|'debug'; files:string[]; at:number; error?:string }
+interface CaptureState { directory:string; record:CaptureJob|null; debug:CaptureJob|null; outputs:CaptureOutput[]; muted:Record<string,boolean> }
 interface PaneWindowState {
   open: boolean
   form: PaneForm
@@ -506,6 +435,19 @@ interface PaneWindowState {
   streamSize: { w: number; h: number } | null
   /** 停靠形态：右侧邻列（卡片详情页）占掉的宽度 —— 面板右边缘让位，排在它左边 */
   dockRight: number
+  capture:CaptureState|null
+  captureBusy:boolean
+  modal:'directory'|'settings'|'outputs'|'preview'|'confirm'|null
+  directoryDraft:string
+  directoryError:string|null
+  directoryPickerOpen:boolean
+  textOpen:boolean
+  deviceText:string
+  preview:CaptureOutput|null
+  previewText:string
+  confirmTitle:string
+  confirmText:string
+  confirmLabel:string
 }
 
 let openCount = 0
@@ -535,6 +477,8 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
     secCanvasVisible: false,
     streamSize: null,
     dockRight: 0,
+    capture:null,captureBusy:false,modal:null,directoryDraft:"",directoryError:null,directoryPickerOpen:false,
+    textOpen:false,deviceText:"",preview:null,previewText:"",confirmTitle:"",confirmText:"",confirmLabel:"",
   }
   private pollTimer: ReturnType<typeof setInterval> | null = null
   private secLumTimer: ReturnType<typeof setInterval> | null = null
@@ -559,11 +503,14 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
   private pref: PanePref = 'auto'
   private lease: DockLease | null = null
   private unwatchNeighbor: (() => void) | null = null
-  private magEl: HTMLDivElement | null = null
-  private magCleanup: (() => void) | null = null
+  private resizeObserver:ResizeObserver|null=null
+  private dialogRef:HTMLDialogElement|null=null
+  private confirmCallback:(()=>void|Promise<void>)|null=null
+  private directoryPicking:AbortController|null=null
+  private captureInflight=false
+  private captureSettled:Promise<void>|null=null
 
   componentDidMount(): void {
-    ensureFontLink()
     try {
       const saved = localStorage.getItem(PREF_KEY)
       if (saved === 'dock' || saved === 'overlay') this.pref = saved
@@ -584,7 +531,11 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
     this.onResize = (): void => this.syncForm()
     window.addEventListener('resize', this.onResize)
     this.onKeyDown = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape' && this.state.open) this.setOpen(false)
+      if (e.key === 'Escape' && this.state.open && this.state.modal==null) {
+        e.preventDefault()
+        if(this.state.textOpen) this.setState({textOpen:false})
+        else this.setOpen(false)
+      }
     }
     window.addEventListener('keydown', this.onKeyDown)
     window.addEventListener('pagehide', this.clearGesture)
@@ -597,10 +548,13 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
 
   componentDidUpdate(): void {
     this.dispatchState()
+    this.fitScreen()
+    if(this.state.modal!=null && this.dialogRef!=null && !this.dialogRef.open) this.dialogRef.showModal()
   }
 
   componentWillUnmount(): void {
     this.unmounted = true
+    this.directoryPicking?.abort()
     window.removeEventListener('pagehide', this.clearGesture)
     if (this.pollTimer != null) clearInterval(this.pollTimer)
     if (this.fpsTimer != null) clearInterval(this.fpsTimer)
@@ -608,13 +562,24 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
     this.stopStream()
     this.bindScreen(null)
     this.releaseLease()
-    this.magCleanup?.()
     this.removeToggle()
     window.removeEventListener('resize', this.onResize)
     window.removeEventListener('keydown', this.onKeyDown)
   }
 
   private setOpen(open: boolean): void {
+    if(!open) {
+      const job=this.state.capture?.record??this.state.capture?.debug
+      if(job!=null) {
+        this.confirmAction('采集中，关闭面板？','停止当前采集并保存后再关闭。保存失败时保留面板和采集记录。','停止并保存',async()=>{
+          await this.captureSettled // Screenshot-in-flight must finish before stopping and saving the recording.
+          const current=this.state.capture?.record??this.state.capture?.debug
+          if(current==null) {this.closeNow();return} // An in-flight stop may already have saved the job.
+          if(await this.captureAction(this.state.capture?.record?'record':'debug',{serial:current.serial,action:'stop'})) this.closeNow()
+        });return
+      }
+      if(this.captureInflight) { this.setState({note:'正在保存，请稍候再关闭。'}); return }
+    }
     this.setState({ open }, () => {
       if (open) {
         void this.poll()
@@ -628,6 +593,8 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
       }
     })
   }
+
+  private closeNow():void { this.setState({open:false,modal:null});this.stopStream();this.releaseLease() }
 
   /** 停靠租约生命周期：开面板时按 pref/窗宽决定形态；claim 失败（他人持租约/窄窗）→ 浮窗降级。 */
   private syncForm(): void {
@@ -689,10 +656,12 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
     try {
       const st = await api<SessionState & { ok: true }>('/session-state')
       const dv = await api<{ devices: DeviceRow[]; quality: { maxSize: number; maxFps: number } } & { ok: true }>('/devices')
+      const capture=await api<CaptureState>('/capture')
+      this.setState({capture})
       const claims = st.claims ?? []
       // 自动跟随（iOS 面板语义）：agent attach 的设备 → 面板自动打开并连接到该设备的流
       const claimed = claims[0]?.serial
-      if (claimed != null && claimed !== this.state.serial) {
+      if (claimed != null && claimed !== this.state.serial && capture.record==null && capture.debug==null && !this.captureInflight) {
         this.setState({ open: true, devices: dv.devices, quality: dv.quality, busy: Object.values(st.busy).some(Boolean), secure: null, secView: 'stream', secSteps: null, outline: null }, () => this.syncForm())
         void this.attach(claimed)
         return
@@ -765,7 +734,7 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
         this.state.mode === 'h264' && this.stream != null && this.stream.frames > 10 &&
         (this.state.streamError != null || this.state.error != null)
       ) {
-        this.setState({ streamError: null, error: null })
+        this.setState({ streamError: null })
       }
       if (this.state.serial != null && !dv.devices.some((d) => d.serial === this.state.serial)) {
         this.setState({ serial: null, mode: null })
@@ -870,7 +839,8 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
       }
     } catch (e) {
       if (stale()) return
-      this.setState({ error: String(e instanceof Error ? e.message : e).slice(0, 220) })
+      this.stopStream()
+      this.setState({ mode: null, error: String(e instanceof Error ? e.message : e).slice(0, 220) })
     }
   }
 
@@ -901,7 +871,7 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
     const rect = el.getBoundingClientRect()
     const srcW = this.canvasRef != null && this.canvasRef.width > 0 ? this.canvasRef.width : (el as unknown as HTMLImageElement).naturalWidth ?? 0
     const srcH = this.canvasRef != null && this.canvasRef.height > 0 ? this.canvasRef.height : (el as unknown as HTMLImageElement).naturalHeight ?? 0
-    if (srcW === 0 || srcH === 0 || rect.width === 0) return null
+    if (srcW === 0 || srcH === 0 || rect.width === 0 || e.clientX<rect.left || e.clientX>=rect.right || e.clientY<rect.top || e.clientY>=rect.bottom) return null
     return {
       x: Math.round(((e.clientX - rect.left) / rect.width) * srcW),
       y: Math.round(((e.clientY - rect.top) / rect.height) * srcH),
@@ -1045,6 +1015,9 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
   private bindScreen = (el: HTMLDivElement | null): void => {
     this.screenRef?.removeEventListener('wheel', this.onWheelNative)
     this.screenRef = el
+    this.resizeObserver?.disconnect()
+    this.resizeObserver=null
+    if(el!=null){this.resizeObserver=new ResizeObserver(()=>this.fitScreen());this.resizeObserver.observe(el)}
     el?.addEventListener('wheel', this.onWheelNative, { passive: false })
   }
 
@@ -1055,7 +1028,7 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
       const r = await api<{ released: boolean; note: string }>('/claim/release', { serial })
       if (this.state.serial !== serial) return
       this.clearGesture()
-      this.setState({ claimSessionId: null, note: r.note })
+      this.setState({ claimSessionId: null, mode: r.released ? null : this.state.mode, note: r.note })
       // Releasing a claim stops its stream; reconnect before accepting live input.
       if (r.released) await this.attach(serial)
       setTimeout(() => this.setState({ note: null }), 6000)
@@ -1065,32 +1038,80 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
     }
   }
 
-  private async toggleDebug(): Promise<void> {
-    if (this.state.serial == null) return
-    const active = this.state.debug != null
-    try {
-      const r = await api<{ id?: string; note: string }>(`/debug`, { serial: this.state.serial, action: active ? 'stop' : 'start' })
-      if (active) {
-        this.setState({ debug: null, note: `${r.note}——对 AI 说「分析调试会话」即可出帧图+日志分析` })
-      } else {
-        this.setState({ debug: { id: r.id ?? `dbg-${Date.now()}`, startedAt: Date.now() }, note: r.note })
-      }
-      setTimeout(() => this.setState({ note: null }), 8000)
-    } catch (e) {
-      this.setState({ error: String(e instanceof Error ? e.message : e).slice(0, 200) })
-      setTimeout(() => this.setState({ error: null }), 4000)
-    }
+  private fitScreen():void {
+    const el=this.canvasRef??this.imgRef,box=this.screenRef
+    if(!el||!box)return
+    const w=el instanceof HTMLCanvasElement?el.width:el.naturalWidth
+    const height=el instanceof HTMLCanvasElement?el.height:el.naturalHeight
+    if(!w||!height)return
+    const scale=Math.max(0,Math.min((box.clientWidth-8)/w,(box.clientHeight-8)/height))
+    el.style.width=w*scale+'px';el.style.height=height*scale+'px'
   }
-
-  private async toggleRecord(): Promise<void> {
-    if (this.state.serial == null) return
-    try {
-      const r = await api<{ note: string; file?: string }>('/record', { serial: this.state.serial, recordAction: this.state.recording ? 'stop' : 'start' })
-      this.setState({ recording: !this.state.recording, error: r.file != null ? `已保存: ${r.file}` : null })
-    } catch (e) {
-      this.setState({ error: String(e instanceof Error ? e.message : e).slice(0, 200) })
-    }
+  private confirmAction(title:string,text:string,label:string,fn:()=>void|Promise<void>):void {
+    this.confirmCallback=fn;this.setState({modal:'confirm',confirmTitle:title,confirmText:text,confirmLabel:label})
   }
+  private openDirectory():void { this.setState({modal:'directory',directoryDraft:this.state.capture?.directory??'',directoryError:null}) }
+  private async browseDirectory():Promise<void> {
+    if(this.state.directoryPickerOpen||this.state.captureBusy||this.state.capture?.record?.status==='recording'||this.state.capture?.debug?.status==='recording')return
+    const controller=new AbortController();this.directoryPicking=controller
+    this.setState({directoryPickerOpen:true,directoryError:null})
+    try {
+      const {directory}=await api<{directory:string|null}>('/capture/pick-directory',{}, {signal:controller.signal})
+      if(!controller.signal.aborted&&!this.unmounted&&this.state.modal==='directory'&&directory!==null)this.setState({directoryDraft:directory})
+    } catch(e) {if(!controller.signal.aborted&&!this.unmounted&&this.state.modal==='directory')this.setState({directoryError:e instanceof Error?e.message:String(e)})}
+    finally {this.directoryPicking=null;if(!this.unmounted)this.setState({directoryPickerOpen:false})}
+  }
+  private async saveDirectory():Promise<void> {
+    if(this.captureInflight)return
+    this.captureInflight=true;this.setState({captureBusy:true,directoryError:null})
+    try {const capture=await api<CaptureState>('/capture/directory',{directory:this.state.directoryDraft.trim()});this.setState({capture,modal:null,note:'统一保存目录已设置。'})}
+    catch(e){this.setState({directoryError:e instanceof Error?e.message:String(e)})}
+    finally{this.captureInflight=false;this.setState({captureBusy:false})}
+  }
+  private async captureAction(action:string,body:Rec):Promise<boolean> {
+    if(this.captureInflight)return false
+    this.captureInflight=true;this.setState({captureBusy:true,error:null,note:null})
+    let settle!:()=>void;this.captureSettled=new Promise<void>(resolve=>{settle=resolve})
+    try {
+      const old=this.state.capture?.outputs.length??0
+      const capture=await api<CaptureState>('/capture/'+action,body)
+      const out=capture.outputs.at(-1)
+      this.setState({capture,note:capture.outputs.length>old&&out&&!out.error?'已保存：'+out.files.join('\n'):null,error:capture.outputs.length>old&&out?.error?'采集异常：'+out.error+String.fromCharCode(10)+'已保留有效文件：'+out.files.join(String.fromCharCode(10)):null})
+      if(action==='screenshot'){this.screenRef?.classList.remove('flash');void this.screenRef?.offsetWidth;this.screenRef?.classList.add('flash')}
+      return true
+    }catch(e){
+      this.setState({error:e instanceof Error?e.message:String(e)})
+      try{this.setState({capture:await api<CaptureState>('/capture')})}catch{}
+      return false
+    }finally{this.captureInflight=false;this.captureSettled=null;settle();if(!this.unmounted)this.setState({captureBusy:false})}
+  }
+  private toggleCapture(type:'record'|'debug'):void {
+    const job=this.state.capture?.[type]
+    if(job){void this.captureAction(type,{serial:job.serial,action:'stop'});return}
+    const serial=this.state.serial
+    if(!serial)return
+    const start=()=>{void this.captureAction(type,{serial,action:'start'})}
+    if(type==='debug'&&this.state.secure?.secure)
+      this.confirmAction('受保护页面','调试仍可抓日志，但视频中的受保护区域可能为黑屏。确认继续？','继续调试',start)
+    else start()
+  }
+  private async previewOutput(output:CaptureOutput):Promise<void> {
+    this.setState({modal:'preview',preview:output,previewText:''})
+    try {
+      const files=await Promise.all(output.files.map(async(file,index)=>{
+        if(!/\.(log|json)$/i.test(file))return ''
+        const response=await fetch(this.fileUrl(output,index));if(!response.ok)throw new Error('预览读取失败 HTTP '+response.status)
+        const reader=response.body?.getReader();if(!reader)throw new Error('预览响应为空')
+        // ponytail: preview bounded to 128 KiB; full artifact remains available as a download.
+        let bytes=0,text='';const decoder=new TextDecoder()
+        try{while(bytes<131072){const r=await reader.read();if(r.done)break;const chunk=r.value.subarray(0,131072-bytes);bytes+=chunk.length;text+=decoder.decode(chunk,{stream:true})}}
+        finally{await reader.cancel()}
+        return file+'\n'+text+'\n'
+      }))
+      if(this.state.preview?.id===output.id)this.setState({previewText:files.join('\n')})
+    }catch(e){if(this.state.preview?.id===output.id)this.setState({previewText:'预览失败：'+String(e)})}
+  }
+  private fileUrl(output:CaptureOutput,index:number):string{return API+'/capture/file?id='+encodeURIComponent(output.id)+'&index='+index}
 
   private async setQuality(maxSize: number, maxFps: number): Promise<void> {
     try {
@@ -1104,30 +1125,8 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
     }
   }
 
-  // ── FLAG_SECURE（B22）：尝试显示（缓解链）→ 判定成功重连流 / 失败自动进降级内容通道 ──
-  private async tryShow(): Promise<void> {
-    if (this.state.serial == null || this.state.secBusy) return
-    this.setState({ secBusy: true, secSteps: null })
-    try {
-      const r = await api<{ pixelPossible: boolean; steps: Array<{ step: string; status: string; detail: string }> }>('/secure/mitigate', { serial: this.state.serial })
-      this.setState({ secBusy: false, secSteps: r.steps })
-      if (r.pixelPossible) {
-        // 保留步骤卡（成功原因也要让用户看到，「知道了」收起）；切快照流
-        this.setState({ secView: 'stream' })
-        this.stopStream()
-        void this.attach(this.state.serial)
-      } else {
-        // 失败 → 自动切降级内容通道（控件树文本视图）
-        await this.fetchOutline()
-      }
-    } catch (e) {
-      this.setState({ secBusy: false, error: String(e instanceof Error ? e.message : e).slice(0, 200) })
-      setTimeout(() => this.setState({ error: null }), 4000)
-    }
-  }
-
   private tapOutline(x: number, y: number): void {
-    void this.act({ action: 'tap', x, y })
+    void this.act({ action: 'tap', x, y, coordinateSpace:'physical' })
   }
 
   /** B22f：采样当前显示元素（canvas/img）的亮度与方差，判定 FLAG_SECURE 页面是否实际可见。
@@ -1178,301 +1177,80 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
     }
   }
 
-  // ── magnetic-btn（拍板标志性效果②）：指针靠近 80px 内按钮被吸向指针（rAF lerp 0.18）──
-  private bindMagnets = (el: HTMLDivElement | null): void => {
-    if (el === this.magEl) return
-    this.magCleanup?.()
-    this.magCleanup = null
-    this.magEl = el
-    if (el == null) return
-    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return
-    const items = Array.from(el.querySelectorAll<HTMLElement>('[data-dap-mag]')).map((b) => ({ b, x: 0, y: 0, tx: 0, ty: 0 }))
-    let raf = 0
-    let inside = false
-    const tick = (): void => {
-      let live = false
-      for (const it of items) {
-        it.x += (it.tx - it.x) * 0.18
-        it.y += (it.ty - it.y) * 0.18
-        if (Math.abs(it.x) > 0.05 || Math.abs(it.y) > 0.05) live = true
-        else {
-          it.x = it.tx
-          it.y = it.ty
-        }
-        it.b.style.transform = `translate(${it.x.toFixed(2)}px, ${it.y.toFixed(2)}px)`
-      }
-      if (live || inside) {
-        raf = requestAnimationFrame(tick)
-      } else {
-        raf = 0
-        for (const it of items) it.b.style.transform = ''
-      }
-    }
-    const onMove = (e: PointerEvent): void => {
-      inside = true
-      for (const it of items) {
-        const r = it.b.getBoundingClientRect()
-        const dx = e.clientX - (r.left + r.width / 2)
-        const dy = e.clientY - (r.top + r.height / 2)
-        if (Math.hypot(dx, dy) < 80) {
-          it.tx = dx * 0.25
-          it.ty = dy * 0.25
-        } else {
-          it.tx = 0
-          it.ty = 0
-        }
-      }
-      if (raf === 0) raf = requestAnimationFrame(tick)
-    }
-    const onLeave = (): void => {
-      inside = false
-      for (const it of items) {
-        it.tx = 0
-        it.ty = 0
-      }
-      if (raf === 0) raf = requestAnimationFrame(tick)
-    }
-    el.addEventListener('pointermove', onMove)
-    el.addEventListener('pointerleave', onLeave)
-    this.magCleanup = () => {
-      el.removeEventListener('pointermove', onMove)
-      el.removeEventListener('pointerleave', onLeave)
-      if (raf !== 0) cancelAnimationFrame(raf)
-      for (const it of items) it.b.style.transform = ''
-    }
+  private renderDialog():ReturnType<typeof h>|null {
+    const {modal,capture,captureBusy,directoryDraft,directoryError,preview,previewText,quality}=this.state
+    if(!modal)return null
+    const close=()=>{this.directoryPicking?.abort();this.confirmCallback=null;this.setState({modal:null})}
+    const title=modal==='directory'?'统一保存目录':modal==='settings'?'面板设置':modal==='outputs'?'最近保存':modal==='preview'?'保存预览':this.state.confirmTitle
+    const locked=this.state.directoryPickerOpen||captureBusy||capture?.record?.status==='recording'||capture?.debug?.status==='recording'
+    let body:ReturnType<typeof h>
+    if(modal==='directory')body=h('form',{onSubmit:(e:React.FormEvent)=>{e.preventDefault();if(!locked)void this.saveDirectory()}},
+      h('label',{htmlFor:'dap-directory-input'},'电脑目录'),
+      h('div',{className:'dap-input-line'},h('input',{id:'dap-directory-input',autoFocus:true,disabled:locked,value:directoryDraft,autoComplete:'off',spellCheck:false,onChange:(e:RChangeEvent<HTMLInputElement>)=>this.setState({directoryDraft:e.target.value})}),h('button',{className:'dap-quiet',type:'button',disabled:locked,onClick:()=>void this.browseDirectory()},'选择')),
+      directoryError?h('div',{className:'dap-field-error',role:'alert'},directoryError):null,
+      locked?h('p',{style:{marginTop:16}},this.state.directoryPickerOpen?'请在系统窗口选择目录。':'采集中，目录不可修改。'):null,
+      h('div',{className:'dap-dialog-actions'},h('button',{type:'button',className:'dap-quiet',onClick:close},'取消'),h('button',{type:'submit',className:'dap-primary',disabled:locked},'保存设置')))
+    else if(modal==='settings')body=h('div',null,
+      h('div',{className:'dap-setting-row'},h('span',null,'画面质量'),h('select',{'aria-label':'画面质量',value:quality.maxFps>=60?'clear':'smooth',disabled:locked||this.state.busy||this.state.claimSessionId!=null,onChange:(e:RChangeEvent<HTMLSelectElement>)=>void this.setQuality(e.target.value==='clear'?1920:1280,e.target.value==='clear'?60:30)},h('option',{value:'smooth'},'流畅 · 30 fps'),h('option',{value:'clear'},'清晰 · 60 fps'))),
+      h('div',{className:'dap-setting-row'},h('span',null,'保存目录'),h('button',{className:'dap-quiet',onClick:()=>this.openDirectory()},'修改目录')))
+    else if(modal==='outputs')body=h('div',{className:'dap-output-list'},capture?.outputs.length?capture.outputs.slice().reverse().map(output=>h('article',{className:'dap-output',key:output.id},
+      h('div',{className:'dap-output-top'},icon(output.type==='screenshot'?'camera':output.type==='record'?'video':'debug'),h('b',null,output.type==='screenshot'?'截图':output.type==='record'?'录屏':'调试记录'),h('time',null,new Date(output.at).toLocaleTimeString('zh-CN',{hour12:false,hour:'2-digit',minute:'2-digit'}))),
+      h('div',{className:'dap-output-files dap-path'},output.files.join('\n')),output.error?h('div',{className:'dap-field-error'},output.error):null,
+      h('button',{className:'dap-output-preview',onClick:()=>void this.previewOutput(output)},'查看'+(output.type==='screenshot'?'截图':output.type==='record'?'视频':'视频与日志')))):h('p',null,'暂无文件'))
+    else if(modal==='preview')body=h('div',null,preview?.files.map((file,index)=>{
+      const src=preview?this.fileUrl(preview,index):''
+      return /\.png$/i.test(file)?h('img',{key:file,src,alt:'已保存的设备截图',className:'dap-preview-media'}):/\.mp4$/i.test(file)?h('video',{key:file,src,controls:true,preload:'metadata',className:'dap-preview-media','aria-label':'已保存的设备录屏'}):null
+    }),previewText?h('pre',{className:'dap-log-preview'},previewText):null,
+    h('div',{className:'dap-path'},preview?.files.join('\n')),
+    preview?.files.map((file,index)=>h('a',{key:file,href:this.fileUrl(preview,index),download:file.split(/[\\/]/).at(-1),className:'dap-output-preview'},'下载 '+file.split(/[\\/]/).at(-1))))
+    else body=h('div',null,h('p',null,this.state.confirmText),h('div',{className:'dap-dialog-actions'},h('button',{className:'dap-quiet',onClick:close},'取消'),h('button',{className:'dap-primary',onClick:()=>{const fn=this.confirmCallback;this.confirmCallback=null;this.setState({modal:null},()=>{void fn?.()})}},this.state.confirmLabel)))
+    return h('dialog',{key:modal,className:'dap-dialog',ref:(el:HTMLDialogElement|null)=>{this.dialogRef=el},'aria-labelledby':'dap-dialog-title',onCancel:(e:React.SyntheticEvent)=>{e.preventDefault();e.stopPropagation();close()},onKeyDown:(e:React.KeyboardEvent)=>{if(e.key==='Escape')e.stopPropagation()}},
+      h('div',{className:'dap-dialog-head'},h('h3',{id:'dap-dialog-title'},title),modal==='confirm'?null:h('button',{className:'dap-icon','aria-label':'关闭'+title,onClick:close},icon('close'))),
+      h('div',{className:'dap-dialog-body'},body))
   }
 
   render(): ReturnType<typeof h> {
-    if (!this.state.open) {
-      return h('div', { style: { display: 'none' } })
+    if(!this.state.open)return h('div',{style:{display:'none'}})
+    const {devices,serial,busy,mode,error,streamError,quality,form,claimSessionId,capture,captureBusy,textOpen,deviceText,note}=this.state
+    const online=devices.filter(d=>d.state==='device'),selected=online.find(d=>d.serial===serial)
+    const connected=serial!=null&&selected!=null&&mode!=null
+    const unavailable=!connected||busy||claimSessionId!=null||captureBusy
+    const record=capture?.record,debug=capture?.debug,job=record??debug
+    const active=job?.status==='recording',directoryLocked=active||captureBusy
+    const protectedPage=this.state.secure?.secure&&this.state.secure.captureVisible!==true&&!this.state.secCanvasVisible
+    const elapsed=(j:CaptureJob|null|undefined)=>{if(!j)return '';const sec=Math.floor(((j.stoppedAt??Date.now())-j.startedAt)/1000);return String(Math.floor(sec/60)).padStart(2,'0')+':'+String(sec%60).padStart(2,'0')}
+    const captureLabel=(type:'record'|'debug')=>{const j=type==='record'?record:debug;return j?(captureBusy?'保存中…':j.status==='pending-save'?'重试保存':'停止'):(type==='record'?'录屏':'调试')}
+    const captureButton=(type:'record'|'debug')=>{const j=type==='record'?record:debug;const disabled=captureBusy||!!(type==='record'?debug:record)||(!j&&(unavailable||(type==='record'&&this.state.secure?.secure)))
+      return h('button',{className:'dap-capture-btn dap-'+type+(j?.status==='recording'?' active':''),disabled,'aria-label':j?.status==='recording'?'停止'+(type==='record'?'录屏':'调试'):captureLabel(type),'data-dap-capture':type,onClick:()=>this.toggleCapture(type)},icon(j?'stop':type==='record'?'video':'debug'),h('b',null,captureLabel(type)),h('small',null,elapsed(j)))
     }
-    const { devices, serial, busy, mode, error, streamError, fps, quality, recording, form, debug, note, claimSessionId } = this.state
-    const online = devices.filter((d) => d.state === 'device')
-    const sel = serial ?? (online.length === 1 ? online[0].serial : '')
-    const docked = form === 'dock'
-    const errMsg = streamError ?? error
-    // 瞬态错误分类：自愈重试尚有预算时，409/断流/限频等只作「重连中」灰字提示，不渲染红色异常（防错误闪烁刷屏）
-    const TRANSIENT_RE = /HTTP 409|串流结束|串流中断|重启过频/
-    const recovering = errMsg != null && mode === 'poll' && this.h264Retries < 3 && TRANSIENT_RE.test(errMsg)
-    // B22f：画面可见性实证（客户端像素采样）→ 横幅隐藏（画面本就可看）；黑屏才提示
-    const snapVisible = this.state.secCanvasVisible
-    const screenCursor = busy ? 'not-allowed' : 'grab'
-    return h(
-      'div',
-      {
-        className: `dap-pane ${docked ? 'dap-dock' : 'dap-overlay'}`,
-        role: 'complementary',
-        'aria-label': 'Android 设备面板',
-        // 停靠时给右侧邻列（卡片详情页）让位：四列排成「会话 | 右侧边栏 | 面板 | 详情」
-        style: docked && this.state.dockRight > 0 ? { right: `${this.state.dockRight}px` } : undefined,
-      },
-      // 头部：贴纸标题 + 设备菜单 + 形态切换 + 关闭
-      h(
-        'div',
-        { className: 'dap-head' },
-        h('span', { className: 'dap-title' }, 'DROID'),
-        h(
-          'select',
-          {
-            className: 'dap-select',
-            value: sel,
-            onChange: (e: RChangeEvent<HTMLSelectElement>) => {
-              const v = e.target.value
-              if (v != null && v !== '' && v !== this.state.serial) {
-                this.stopStream()
-                this.setState({ serial: v, mode: null, streamError: null, error: null, recording: false, secure: null, secView: 'stream', secSteps: null, outline: null, streamSize: null })
-                void this.attach(v)
-              }
-            },
-          },
-          online.length === 0 ? h('option', { value: '' }, '无在线设备') : null,
-          online.map((d) =>
-            h('option', { key: d.serial, value: d.serial },
-              `${d.name ?? d.model ?? d.serial}${d.claimedBy != null ? ' · 智能体认领中' : ''}`),
-          ),
-        ),
-        h('button', { className: 'dap-btn2', title: docked ? '切到浮窗' : '停靠到右侧', onClick: () => this.toggleForm() }, docked ? '◫' : '▥'),
-        h('button', { className: 'dap-btn2', title: '关闭面板（Esc）', onClick: () => this.setOpen(false) }, '✕'),
-      ),
-      // 锁定徽标：被智能体会话认领 → 全程锁（用户可强制解锁接管）
-      claimSessionId != null
-        ? h('div', { className: 'dap-busy' },
-            h('span', null, `🔒 智能体锁定中 · ${claimSessionId}`),
-            h('button', { className: 'dap-unlock', title: '强制释放认领锁（原会话下次操作需重新 attach）', onClick: () => void this.forceRelease() }, '强制解锁'),
-          )
-        : busy
-        ? h('div', { className: 'dap-busy' }, '智能体操作中 · 请稍候')
-        : null,
-      // FLAG_SECURE 横幅（B22）：仅在「检测到但未可见（h264 黑屏）」或「大纲模式」时出现；
-      // 快照流已可见时隐藏（B22e 用户反馈：都看到了就不必再提示，状态看 FPS 行「快照流 · FLAG_SECURE 可见」）
-      this.state.secure?.secure === true && serial != null && !snapVisible
-        ? h('div', { className: 'dap-secrow' },
-            h('span', {
-              className: 'dap-sectext',
-              title: 'FLAG_SECURE：应用声明此页面禁止截屏/录屏，系统层面屏蔽画面（非面板故障）',
-            }, `🔒 FLAG_SECURE${this.state.secure.pkg != null ? ` · ${this.state.secure.pkg}` : ''}`),
-            this.state.secView === 'outline'
-              ? h('button', { className: 'dap-btn2', title: '回到画面视图（FLAG_SECURE 下仍为黑屏）', onClick: () => this.setState({ secView: 'stream' }) }, '切回画面')
-              : h('button', { className: 'dap-btn2', disabled: this.state.secBusy, title: '执行 adb root 等必要动作并判定像素是否可见', onClick: () => void this.tryShow() }, this.state.secBusy ? '尝试中…' : '尝试显示'),
-          )
-        : null,
-      // 画面区：三态（连接中骨架屏 / 空态 / 直播画面）+ FLAG_SECURE 降级内容通道
-      h(
-        'div',
-        {
-          className: 'dap-screen',
-          ref: this.bindScreen as unknown as (el: HTMLDivElement | null) => void,
-          onPointerDown: this.onPointerDown, onPointerMove: this.onPointerMove, onPointerUp: this.onPointerUp,
-          onPointerCancel: this.onPointerCancel, onLostPointerCapture: this.onPointerCancel,
-        },
-        this.state.secView === 'outline' && this.state.outline != null
-          ? h('div', { className: 'dap-outline' },
-              h('div', { className: 'dap-outline-hd' },
-                h('span', null, 'FLAG_SECURE 页面 · 目前设备状态不支持显示画面，已切至内容通道（控件树文本视图）'),
-                h('button', { className: 'dap-btn2', title: '重新读取控件树', onClick: () => void this.fetchOutline() }, '刷新'),
-              ),
-              h('div', { className: 'dap-outline-list' },
-                this.state.outline.length === 0 ? h('div', { className: 'dap-outline-empty' }, '无可见文本节点') : null,
-                this.state.outline.map((n, i) =>
-                  h('button', {
-                    key: i,
-                    className: `dap-outline-item${n.clickable ? ' ck' : ''}`,
-                    style: { paddingLeft: `${6 + Math.min(n.depth, 10) * 12}px` },
-                    title: n.clickable ? '点击 = 点按该元素中心' : '仅文本（不可点）',
-                    onClick: () => this.tapOutline(n.center[0], n.center[1]),
-                  },
-                    h('span', { className: 'dap-ot' }, n.text || n.desc),
-                    h('span', { className: 'dap-oc' }, (n.clickable ? '▸ ' : '') + (n.cls.split('.').pop() ?? n.cls)),
-                  ),
-                ),
-              ),
-            )
-          : mode === 'poll'
-          ? h('img', {
-              ref: (el: HTMLImageElement | null): void => {
-                this.imgRef = el
-              },
-              src: serial != null ? `${API}/frame?serial=${encodeURIComponent(serial)}&t=${Date.now()}` : undefined,
-              draggable: false,
-              alt: '设备画面（截图轮播）',
-            })
-          : mode === 'h264'
-          ? h('canvas', {
-              width: this.state.streamSize?.w,
-              height: this.state.streamSize?.h,
-              ref: (el: HTMLCanvasElement | null): void => {
-                this.canvasRef = el
-              },
-              style: { touchAction: 'none', cursor: screenCursor },
-            })
-          : null, // mode==null：连接中，只显示骨架屏（不渲染残留画面）
-        serial == null && online.length === 0
-          ? h('div', { className: 'dap-state' },
-              h('svg', { viewBox: '0 0 24 24', width: 54, height: 54, fill: 'none', 'aria-hidden': 'true' },
-                h('path', { d: 'M7.4 4.4 9.1 6.5 M16.6 4.4 14.9 6.5', stroke: '#efe9db', 'stroke-width': '1.5', 'stroke-linecap': 'round' }),
-                h('path', { d: 'M4.6 15.2 a7.4 7.4 0 0 1 14.8 0 Z', fill: '#efe9db' }),
-                h('circle', { cx: '9.3', cy: '12.6', r: '0.95', fill: '#3a3128' }),
-                h('circle', { cx: '14.7', cy: '12.6', r: '0.95', fill: '#3a3128' }),
-              ),
-              h('div', { className: 'dap-state-txt' }, '没有在线设备'),
-              h('div', { className: 'dap-state-sub' }, '用 adb 连接一台设备，或启动一个模拟器——面板会自动出现画面'),
-            )
-          : null,
-        serial == null && online.length > 0
-          ? h('div', { className: 'dap-state' },
-              h('div', { className: 'dap-skel' }), h('div', { className: 'dap-skel b' }), h('div', { className: 'dap-skel c' }),
-              h('div', { className: 'dap-state-txt' }, '连接中…'),
-            )
-          : null,
-        serial != null && mode == null
-          ? h('div', { className: 'dap-state' },
-              h('div', { className: 'dap-skel' }), h('div', { className: 'dap-skel c' }),
-              h('div', { className: 'dap-state-txt' }, '连接中…'),
-            )
-          : null,
-      ),
-      // 工具栏（磁吸按钮组）
-      h(
-        'div',
-        {
-          className: 'dap-head',
-          ref: this.bindMagnets as unknown as (el: HTMLDivElement | null) => void,
-        },
-        h('button', { className: 'dap-btn2', 'data-dap-mag': '1', title: '返回 BACK', onClick: () => void this.act({ action: 'key', key: 'back' }) }, '←'),
-        h('button', { className: 'dap-btn2', 'data-dap-mag': '1', title: 'HOME', onClick: () => void this.act({ action: 'key', key: 'home' }) }, '⌂'),
-        h('button', { className: 'dap-btn2', 'data-dap-mag': '1', title: '多任务 RECENTS', onClick: () => void this.act({ action: 'key', key: 'recents' }) }, '▭'),
-        h('button', { className: 'dap-btn2', 'data-dap-mag': '1', title: '音量+', onClick: () => void this.act({ action: 'key', key: 'volume_up' }) }, 'Vol+'),
-        h('button', { className: 'dap-btn2', 'data-dap-mag': '1', title: '音量-', onClick: () => void this.act({ action: 'key', key: 'volume_down' }) }, 'Vol-'),
-        h('button', { className: 'dap-btn2', 'data-dap-mag': '1', title: '旋转', onClick: () => void this.act({ action: 'rotate' }) }, '⟳'),
-        h('button', {
-          className: 'dap-btn2', 'data-dap-mag': '1', title: '截图保存',
-          onClick: () => { if (serial != null) window.open(`${API}/frame?serial=${encodeURIComponent(serial)}`, '_blank') },
-        }, '截图'),
-        h('button', {
-          className: `dap-btn2${recording ? ' dap-rec' : ''}`, 'data-dap-mag': '1', title: '录屏开/停',
-          onClick: () => void this.toggleRecord(),
-        }, recording ? '停' : '录'),
-        h('button', {
-          className: `dap-btn2${debug != null ? ' dap-rec' : ''}`, 'data-dap-mag': '1',
-          title: '调试会话：录屏(分段)+logcat 全量+操作时间线，host 强制托管',
-          onClick: () => void this.toggleDebug(),
-        }, debug != null ? `⏺ ${Math.floor((Date.now() - debug.startedAt) / 60000)}:${String(Math.floor(((Date.now() - debug.startedAt) / 1000) % 60)).padStart(2, '0')}` : '调试'),
-      ),
-      // 画质行
-      h(
-        'div',
-        { className: 'dap-meta' },
-        h('span', null, `FPS ${fps}`),
-        h('span', null, mode != null ? (mode === 'h264' ? 'H.264 实时' : this.state.secure?.secure === true && this.state.secure?.captureVisible === true ? '快照流 · FLAG_SECURE 可见' : '截图轮播（降级）') : '未连接'),
-        h('span', { className: 'grow' }),
-        h(
-          'select',
-          {
-            className: 'dap-mini',
-            value: String(quality.maxSize),
-            onChange: (e: RChangeEvent<HTMLSelectElement>) => void this.setQuality(Number(e.target.value), quality.maxFps),
-          },
-          [[0, '原生'], [800, '800p'], [1280, '1280'], [1920, '1920']].map(([v, label]) =>
-            h('option', { key: String(v), value: String(v) }, `清晰度 ${label as string}`),
-          ),
-        ),
-        h(
-          'select',
-          {
-            className: 'dap-mini',
-            value: String(quality.maxFps),
-            onChange: (e: RChangeEvent<HTMLSelectElement>) => void this.setQuality(quality.maxSize, Number(e.target.value)),
-          },
-          [15, 30, 60].map((v) => h('option', { key: v, value: String(v) }, `${v} fps`)),
-        ),
-      ),
-      // 错误行：瞬态 → 灰字「重连中」；真异常 → 红字 + 一键重试
-      errMsg != null && serial != null
-        ? h('div', { className: recovering ? 'dap-reconnect' : 'dap-errrow' },
-            h('span', null, recovering ? `重连中… ${errMsg}` : errMsg),
-            recovering ? null : h('button', { className: 'dap-btn2', onClick: () => void this.attach(serial) }, '重试'),
-          )
-        : null,
-      // FLAG_SECURE 缓解链结果（B22）：每步 ✓/✗/⏭/💡 + 明确判定；点「知道了」收起
-      this.state.secSteps != null
-        ? h('div', { className: 'dap-secsteps' },
-            this.state.secSteps.map((s, i) =>
-              h('div', { key: i, className: `dap-step st-${s.status}` },
-                h('span', { className: 'dap-st-ic' }, s.status === 'ok' ? '✓' : s.status === 'failed' ? '✗' : s.status === 'hint' ? '💡' : '⏭'),
-                h('span', { className: 'dap-st-nm' }, s.step),
-                h('span', { className: 'dap-st-dt' }, s.detail),
-              ),
-            ),
-            h('button', { className: 'dap-btn2', onClick: () => this.setState({ secSteps: null }) }, '知道了'),
-          )
-        : null,
-      // 提示行（调试会话开/关反馈）
-      note != null ? h('div', { className: 'dap-note-hl' }, note) : null,
-      // 隐私提示
-      h('div', { className: 'dap-note' }, '受控设备勿登录真实账号（截屏会发给模型）· 点击=点按，拖动=滑动，长按=长按'),
-    )
+    const nav=(name:string,label:string,fn:()=>void)=>h('button',{className:'dap-btn2',disabled:unavailable,title:label,'aria-label':label,onClick:fn},icon(name))
+    const errMsg=error??streamError??job?.error
+    // Escape the host overlay slot's stacking context; fixed coordinates and dock lease stay unchanged.
+    return createPortal(h('div',{className:'dap-pane '+(form==='dock'?'dap-dock':'dap-overlay'),'data-dap-version':'0.2.0',role:'complementary','aria-label':'Android 设备面板',style:form==='dock'&&this.state.dockRight>0?{right:this.state.dockRight+'px'}:undefined},
+      h('header',{className:'dap-head'},h('select',{className:'dap-select','aria-label':'选择设备',disabled:!!job||captureBusy,value:serial??'',onChange:(e:RChangeEvent<HTMLSelectElement>)=>{const next=e.target.value;if(next&&next!==serial){this.stopStream();this.setState({serial:next,mode:null,streamError:null,error:null,secure:null,secView:'stream',secSteps:null,outline:null,streamSize:null});void this.attach(next)}}},online.length?online.map(d=>h('option',{key:d.serial,value:d.serial},d.name??d.model??d.serial)):h('option',{value:''},'无在线设备')),
+        h('button',{className:'dap-icon',disabled:!!job||captureBusy||claimSessionId!=null||busy,title:'重新连接设备','aria-label':'重新连接设备',onClick:()=>{if(serial)void this.attach(serial);else void this.poll()}},icon('refresh')),
+        h('button',{className:'dap-icon',title:'面板设置','aria-label':'面板设置',onClick:()=>this.setState({modal:'settings'})},icon('settings')),
+        h('button',{className:'dap-icon',title:form==='dock'?'切换浮窗':'恢复停靠','aria-label':form==='dock'?'切换浮窗':'恢复停靠',onClick:()=>this.toggleForm()},icon('float')),
+        h('button',{className:'dap-icon',title:'关闭面板','aria-label':'关闭面板',onClick:()=>this.setOpen(false)},icon('close'))),
+      h('section',{className:'dap-capture-zone'},h('div',{className:'dap-directory-row'},icon('folder'),h('div',{className:'dap-path','data-dap-directory':true},capture?.directory??'读取目录…'),h('button',{className:'dap-icon',title:'设置统一保存目录','aria-label':'设置统一保存目录',onClick:()=>this.openDirectory()},icon('settings'))),
+        h('div',{className:'dap-capture-buttons'},h('button',{className:'dap-capture-btn dap-shot',disabled:unavailable||!capture||protectedPage,'data-dap-capture':'screenshot',onClick:()=>{if(serial)void this.captureAction('screenshot',{serial})}},icon('camera'),h('b',null,'截图')),captureButton('record'),captureButton('debug'))),
+      claimSessionId!=null||busy?h('div',{className:'dap-state-banner'},icon('lock'),h('span',null,'智能体正在使用设备，操作已锁定。'),claimSessionId!=null?h('button',{className:'dap-quiet',onClick:()=>this.confirmAction('接管设备','接管会释放智能体的操作锁。原会话需要重新连接才能继续操作。','释放锁并接管',()=>this.forceRelease())},'接管'):null):null,
+      h('div',{className:'dap-screen'+(active?' capturing':''),ref:this.bindScreen,onPointerDown:this.onPointerDown,onPointerMove:this.onPointerMove,onPointerUp:this.onPointerUp,onPointerCancel:this.onPointerCancel,onLostPointerCapture:this.onPointerCancel},
+        this.state.secView==='outline'&&this.state.outline!=null?h('div',{className:'dap-outline'},h('div',{className:'dap-outline-hd'},h('span',null,'受保护页面 · 控件树'),h('button',{className:'dap-quiet',onClick:()=>this.setState({secView:'stream'})},'切回画面'),h('button',{className:'dap-quiet',disabled:unavailable,onClick:()=>void this.fetchOutline()},'刷新')),
+          h('div',{className:'dap-outline-list'},this.state.outline.length?this.state.outline.map((node,index)=>h('button',{key:index,className:'dap-outline-item',disabled:unavailable||!node.clickable,style:{paddingLeft:6+Math.min(node.depth,10)*12},onClick:()=>this.tapOutline(node.center[0],node.center[1])},h('span',{className:'dap-ot'},node.text||node.desc),h('span',{className:'dap-oc'},node.cls.split('.').at(-1)))):h('p',null,'无可见文本节点'))):
+        protectedPage?h('div',{className:'dap-state'},icon('lock'),h('h3',{className:'dap-state-txt'},'应用保护了此页面'),h('p',{className:'dap-state-sub'},'系统禁止截屏和录屏。可查看控件树继续操作，不自动获取 root 权限。'),h('button',{className:'dap-quiet',disabled:unavailable,onClick:()=>void this.fetchOutline()},'查看控件树')):
+        connected&&mode==='poll'?h('img',{ref:(el:HTMLImageElement|null):void=>{this.imgRef=el;this.canvasRef=null},src:API+'/frame?serial='+encodeURIComponent(serial!)+'&t='+Date.now(),onLoad:()=>this.fitScreen(),draggable:false,alt:'设备画面'}):
+        connected&&mode==='h264'?h('canvas',{width:this.state.streamSize?.w,height:this.state.streamSize?.h,ref:(el:HTMLCanvasElement|null):void=>{this.canvasRef=el;this.imgRef=null},style:{touchAction:'none',cursor:unavailable?'not-allowed':'grab'},'aria-label':'设备画面，可点击和拖动'}):
+        h('div',{className:'dap-state'},icon('refresh'),h('h3',{className:'dap-state-txt'},serial&&selected?'连接中…':'设备已断开'),h('p',{className:'dap-state-sub'},'连接 USB 设备并允许调试，或启动 Android 模拟器。'),h('button',{className:'dap-primary',disabled:claimSessionId!=null||busy||captureBusy,onClick:()=>{if(serial)void this.attach(serial);else void this.poll()}},'重新连接'))),
+      h('nav',{className:'dap-navigation','aria-label':'设备操作'},h('div',{className:'dap-nav-group'},nav('back','返回',()=>{if(this.state.secView==='outline')this.setState({secView:'stream'});else void this.act({action:'key',key:'back'})}),nav('home','主屏幕',()=>void this.act({action:'key',key:'home'})),nav('recents','最近任务',()=>void this.act({action:'key',key:'recents'})),h('button',{className:'dap-btn2',disabled:unavailable,title:'输入文字','aria-label':'输入文字','aria-expanded':textOpen,onClick:()=>this.setState({textOpen:!textOpen})},icon('keyboard'))),
+        h('button',{className:'dap-btn2 dap-mute',disabled:unavailable,'aria-pressed':!!(serial&&capture?.muted[serial]),title:serial&&capture?.muted[serial]?'恢复此前的设备媒体音量':'设备媒体静音，不影响来电和闹钟',onClick:()=>{if(serial)void this.captureAction('mute',{serial})}},icon(serial&&capture?.muted[serial]?'volume':'mute'),h('span',null,serial&&capture?.muted[serial]?'已静音':'静音')),
+        h('button',{className:'dap-btn2',title:'最近保存','aria-label':'最近保存','aria-expanded':this.state.modal==='outputs',onClick:()=>this.setState({modal:'outputs'})},icon('folder'),capture?.outputs.length?h('span',null,capture.outputs.length):null)),
+      textOpen?h('form',{className:'dap-text-entry',onSubmit:(e:React.FormEvent)=>{e.preventDefault();if(!unavailable&&deviceText.trim())void this.act({action:'text',text:deviceText})}},h('input',{'aria-label':'发送到设备的文字',placeholder:'输入要发送到设备的文字',maxLength:4000,value:deviceText,autoFocus:true,disabled:unavailable,onChange:(e:RChangeEvent<HTMLInputElement>)=>this.setState({deviceText:e.target.value})}),h('button',{type:'submit',className:'dap-quiet',disabled:unavailable||!deviceText.trim()},'发送')):null,
+      errMsg||note?h('div',{className:'dap-toast'+(errMsg?' error':''),role:errMsg?'alert':'status'},icon(errMsg?'alert':'check'),h('p',null,errMsg??note),h('button',{className:'dap-icon','aria-label':'关闭提示',onClick:()=>this.setState({error:null,streamError:null,note:null})},icon('close'))):null,
+      this.renderDialog()),document.body)
   }
 }
+
 
 /** 头部入口按钮：渐变胶囊 + 光泽扫过 + 按压缩放 + 设备呼吸灯 + 面板开启高亮态。 */
 export function PaneSidebarButton(): ReturnType<typeof h> {
@@ -1541,7 +1319,7 @@ export function PaneSidebarButton(): ReturnType<typeof h> {
 
 export const inject = ['slots']
 
-export function apply(ctx: { slots: { inject(slot: string, register: () => unknown): void; register(meta: Rec, component?: unknown): unknown }; effect(fn: () => unknown, label?: string): void }): void {
+export function apply(ctx: { slots: { entries(slot:string):Array<{component:React.ElementType;inject?:()=>Rec}>; inject(slot: string, register: () => unknown): void; register(meta: Rec, component?: unknown): unknown }; effect(fn: () => unknown, label?: string): void }): void {
   // B24 样式生命周期：同步先挂（样式先于组件注册，行为与旧版一致），随后托管自愈——
   // ① 外力摘除/清空标签 → head MutationObserver（摘除即恢复）+ 5s 巡检兜底，恢复即 console.warn 点名（fail loud）
   // ② 内容比对原子换新：热重载后新 CSS 立即生效，无需整页刷新

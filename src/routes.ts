@@ -8,6 +8,8 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { isIP } from 'node:net'
+import { closeSync, createReadStream, fstatSync, openSync, constants } from 'node:fs'
+import { extname } from 'node:path'
 import type { PaneHub } from './pane-service.js'
 import type { ActRequest } from './pane-service.js'
 
@@ -103,7 +105,15 @@ export function mountPaneRoutes(
   webServer: { register(route: { kind: 'exact' | 'prefix'; path: string; handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void> }): () => void },
   hub: PaneHub,
   sessionIdOf: (req: IncomingMessage) => string | null,
+  pickDirectory = async (signal: AbortSignal): Promise<string|null> => {
+    const nativePackage = '@deepseek-ai/dsh-host-directory-picker-native'
+    const {pickNativeDirectory} = await import(nativePackage)
+    signal.throwIfAborted()
+    return pickNativeDirectory(signal)
+  },
 ): () => void {
+  // ponytail: one host chooser at a time; use per-display ownership only for multi-display operators.
+  let picker: AbortController|null = null
   const unregister = webServer.register({
     kind: 'prefix',
     path: ROUTE_PREFIX,
@@ -124,6 +134,87 @@ export function mountPaneRoutes(
         }
         const serial = serialQ ?? strArg(body ?? {}, 'serial')
         let sessionId = sessionIdOf(req)
+
+        if (sub === '/capture' && method === 'GET') {
+          sendJson(res, 200, { ok: true, ...hub.captureState() })
+          return
+        }
+        if (sub === '/capture/file' && method === 'GET') {
+          if (!sameOriginHost(req) || req.headers['sec-fetch-site'] === 'cross-site') {
+            sendErr(res, 403, 'forbidden', '跨源文件预览被拒绝')
+            return
+          }
+          const id = url.searchParams.get('id') ?? ''
+          const rawIndex = url.searchParams.get('index') ?? ''
+          if (!/^\d+$/.test(rawIndex)) { sendErr(res, 400, 'bad-request', 'index 须为非负整数'); return }
+          const registered = hub.captureFile(id, Number(rawIndex))
+          const fd = openSync(registered.file, constants.O_RDONLY | constants.O_NOFOLLOW)
+          try {
+            const stat = fstatSync(fd)
+            if (!stat.isFile() || stat.dev !== registered.dev || stat.ino !== registered.ino) {
+              closeSync(fd); sendErr(res, 404, 'not-found', '保存文件已被替换'); return
+            }
+            let start = 0, end = stat.size - 1, status = 200
+            const range = req.headers.range
+            if (range != null) {
+              const match = /^bytes=(\d*)-(\d*)$/.exec(range)
+              if (match == null || (!match[1] && !match[2])) {
+                closeSync(fd); res.writeHead(416, { 'content-range': 'bytes */' + stat.size }); res.end(); return
+              }
+              if (match[1]) { start = Number(match[1]); end = match[2] ? Math.min(Number(match[2]), end) : end }
+              else { start = Math.max(0, stat.size - Number(match[2])) }
+              if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end || start >= stat.size || (match[1] === '' && Number(match[2]) === 0)) {
+                closeSync(fd); res.writeHead(416, { 'content-range': 'bytes */' + stat.size }); res.end(); return
+              }
+              status = 206
+            }
+            const mime: Record<string, string> = { '.png': 'image/png', '.mp4': 'video/mp4', '.log': 'text/plain; charset=utf-8', '.json': 'application/json; charset=utf-8' }
+            res.writeHead(status, {
+              'content-type': mime[extname(registered.file)] ?? 'application/octet-stream',
+              'content-length': end - start + 1, 'accept-ranges': 'bytes', 'cache-control': 'no-store',
+              'x-content-type-options': 'nosniff', 'cross-origin-resource-policy': 'same-origin',
+              ...(status === 206 ? { 'content-range': 'bytes ' + start + '-' + end + '/' + stat.size } : {}),
+            })
+            const stream = createReadStream(registered.file, { fd, autoClose: true, start, end })
+            stream.on('error', () => res.destroy())
+            res.on('close', () => stream.destroy())
+            stream.pipe(res)
+          } catch (e) {
+            try { closeSync(fd) } catch { /* A previous validation already closed it. */ }
+            throw e
+          }
+          return
+        }
+        if (sub === '/capture/pick-directory' && method === 'POST') {
+          if (!sameOriginHost(req) || req.headers['sec-fetch-site'] === 'cross-site') { sendErr(res, 403, 'forbidden', '跨源请求被拒绝'); return }
+          if (picker) { sendErr(res, 409, 'picker-busy', '系统目录选择器已打开'); return }
+          const controller = new AbortController()
+          picker = controller
+          const abort = () => controller.abort()
+          res.once('close', abort)
+          try {
+            const directory = await pickDirectory(controller.signal)
+            if (!controller.signal.aborted) sendJson(res, 200, {ok:true, directory})
+          } finally { res.off('close', abort); picker = null }
+          return
+        }
+        if (sub.startsWith('/capture/') && method === 'POST') {
+          if (!sameOriginHost(req)) { sendErr(res, 403, 'forbidden', '跨源请求被拒绝'); return }
+          const operation = sub.slice('/capture/'.length)
+          if (operation === 'directory') {
+            const directory = strArg(body ?? {}, 'directory')
+            if (directory == null) { sendErr(res, 400, 'bad-request', '缺少 directory'); return }
+            hub.setCaptureDirectory(directory)
+          } else {
+            if (!['screenshot', 'record', 'debug', 'mute'].includes(operation)) { sendErr(res, 404, 'not-found', '未知采集操作'); return }
+            if (serial == null || serial === '') { sendErr(res, 400, 'bad-request', '缺少 serial'); return }
+            const action = strArg(body ?? {}, 'action')
+            if ((operation === 'record' || operation === 'debug') && action !== 'start' && action !== 'stop') { sendErr(res, 400, 'bad-request', 'action 须为 start|stop'); return }
+            await hub.capturePanel(serial, operation as 'screenshot' | 'record' | 'debug' | 'mute', action as 'start' | 'stop' | undefined)
+          }
+          sendJson(res, 200, { ok: true, ...hub.captureState() })
+          return
+        }
 
         if (sub === '/session-state' && method === 'GET') {
           sendJson(res, 200, { ok: true, ...(await hub.sessionState()) })
@@ -197,7 +288,10 @@ export function mountPaneRoutes(
             sendJson(res, 200, { ok: true, ...hub.panelInput(serial, body?.input) })
             return
           }
+          const coordinateSpace = body?.coordinateSpace
+          if (coordinateSpace != null && coordinateSpace !== 'physical' && coordinateSpace !== 'stream') { sendErr(res, 400, 'bad-request', 'coordinateSpace 须为 stream|physical'); return }
           const reqAct: ActRequest = {
+            coordinateSpace: coordinateSpace as ActRequest['coordinateSpace'],
             action: action as ActRequest['action'],
             serial,
             x: numArg(body ?? {}, 'x'),
@@ -244,8 +338,8 @@ export function mountPaneRoutes(
             sendErr(res, 400, 'bad-request', '缺少 serial')
             return
           }
-          const r = await hub.record(serial, act, undefined)
-          sendJson(res, 200, { ok: true, ...r })
+          await hub.capturePanel(serial, 'record', act)
+          sendJson(res, 200, { ok: true, ...hub.captureState() })
           return
         }
         if (sub === '/claim/release' && method === 'POST') {
@@ -279,8 +373,8 @@ export function mountPaneRoutes(
             sendErr(res, 400, 'bad-request', '缺少 serial')
             return
           }
-          const r = act === 'start' ? hub.debugStart(serial, 'human') : await hub.debugStop(serial)
-          sendJson(res, 200, { ok: true, ...r })
+          await hub.capturePanel(serial, 'debug', act)
+          sendJson(res, 200, { ok: true, ...hub.captureState() })
           return
         }
         if (sub === '/secure/mitigate' && method === 'POST') {
@@ -409,6 +503,8 @@ export function mountPaneRoutes(
         dbg(`route exception path=${req.url?.slice(-40)} headersSent=${res.headersSent} msg=${msg}`)
         if (!res.headersSent) {
           if (code === 'bad-request') sendErr(res, 400, code, msg)
+          else if (code === 'not-found') sendErr(res, 404, code, msg)
+          else if (code === 'capture-busy') sendErr(res, 409, code, msg)
           else if (code === 'agent-busy' || code === 'input-busy' || code === 'input-stale' || code === 'no-stream') sendErr(res, 409, code, msg)
           else sendErr(res, 500, 'internal', msg)
         } else {
@@ -421,5 +517,5 @@ export function mountPaneRoutes(
       }
     },
   })
-  return unregister
+  return () => { picker?.abort(); unregister() }
 }

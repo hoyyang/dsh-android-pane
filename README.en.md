@@ -20,8 +20,13 @@ dsh plugin add github:hoyyang/dsh-android-pane
 
 Zero configuration: no API keys, no DSH config edits. Requires `adb` on PATH (Android SDK), a device with USB debugging (or any emulator); macOS/Linux and the DSH web profile.
 
+### Development version 0.2.0: capture studio (unreleased)
+
+Screenshot / record / debug now save real files into one host directory: PNG for screenshots, MP4 for recordings, segmented MP4 + full logcat + action timeline (same prefix) for debug sessions. The pane keeps a full path bar at the top; settings use the host OS folder chooser (selection fills the draft, Save settings commits it; locked while capturing). Failures never report success and keep the device original plus a retry path, including switching directories; pending saves survive a host reload. Buttons turn into Stop with a timer in place, media mute/release replaces the old volume and rotate buttons, and Recent saves previews images and videos.
+
 ## Why it's useful
 
+- **Capture studio**: screenshot / record / debug save into one host directory with shared prefixes and later review; debug sessions carry an action timeline and per-action pre/post frames (frame times derived from the device clock plus the recording's embedded native timestamps, marked uncalibrated when they cannot be proven).
 - **Live stream**: scrcpy-server H.264 straight into the DSH web UI, decoded via WebCodecs (30–60 fps on loopback); automatic fallback to screenshot polling when scrcpy can't run (old devices, hardened security builds).
 - **The agent verifies itself**: 10 context-economical tools — tap/swipe/text/key/scroll/rotate (auto-screenshot after every action), uiautomator element tree with tap coordinates, mp4 recording, host-managed debug sessions (recording + logcat + action timeline).
 - **FLAG_SECURE self-recovery**: banking/password apps are detected automatically; a banner plus a mitigation chain (`adb root` → root-framework guidance → final SECURE-flag re-check), degrading to a tappable text view of the element tree when pixels stay system-blocked — every step reported, never silent.

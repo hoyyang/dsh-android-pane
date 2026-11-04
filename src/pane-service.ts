@@ -6,24 +6,28 @@
  *  - 闲置回收（规则4）：10 分钟无活动 → 释放认领 + 停流；模拟器额外 emu kill，真机仅断开；
  *  - 资源上限（规则7）：每会话 4 路、全局 8 路；
  *  - 降级（规则6/MVP）：scrcpy 启动失败 → 该设备进入 poll 模式（截图轮播），注入走 adb input；
- *  - 隐私（规则8）：截图只落 <dshHome>/dsh-android-pane/shots，路径透明。
+ *  - 隐私（规则8）：截图/录屏/调试写入宿主配置的绝对目录，路径透明。
  */
 import { spawn, type ChildProcess } from 'node:child_process'
-import { createWriteStream, mkdirSync, readFileSync, writeFileSync, type WriteStream } from 'node:fs'
+import { closeSync, openSync, readSync, createReadStream, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync, type WriteStream } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { createInterface } from 'node:readline'
 import { dirname, join } from 'node:path'
 import { Adb, isEmulatorSerial, type AdbDevice } from './adb.js'
-import { PaneStateStore, type QualityPrefs } from './state.js'
+import { PaneStateStore, validateCaptureDirectory, type QualityPrefs, type PendingCapture, type DebugClock } from './state.js'
 import { ACTION_DOWN, ACTION_MOVE, ACTION_UP, StreamSession, parsePanelInput } from './scrcpy-host.js'
 import { extractSecureState, HINT_DISABLE_FLAG_SECURE, type MitigateResult, type MitigateStep, type SecureFocus } from './flag-secure.js'
 
 export interface DebugSegment {
   remote: string
   local?: string
+  error?: string
   startEpoch: number
   endEpoch?: number
 }
 export interface DebugAct {
   t: number
+  endedAt?: number
   action: string
   detail?: string
 }
@@ -41,10 +45,20 @@ export interface DebugSession {
   errFile: string
   errStream: WriteStream | null
   acts: DebugAct[]
+  pendingActions?: Set<Promise<void>>
   segIndex: number
   shortRotations: number
   rotateTimer: NodeJS.Timeout | null
   dir: string
+  captureOptions: string
+  clockStart?: DebugClock
+  clockEnd?: DebugClock
+  error?: string
+  captureError?: string
+  logRemote: string
+  logLocal?: string
+  saving?: Promise<{ id: string; note: string; summary?: DebugSummary }>
+  saved?: boolean
 }
 export interface DebugSummary {
   id: string
@@ -61,12 +75,45 @@ export interface DebugAnalysis {
   serial: string
   durationMs: number
   timeline: string[]
-  frames: Array<{ file: string; label: string; t: number; kind: 'pre' | 'post' | 'sample' }>
+  frames: Array<{ file: string; label: string; t: number; kind: 'pre' | 'post' | 'sample'; pts: number; requestedAt?: number; frameAt?: number; uncertaintyMs?: number; timing: 'calibrated' | 'uncalibrated' }>
+  frameIssues: string[]
   logSlices: string[]
   errorLines: string[]
   logTail: string[]
   mp4s: string[]
   errFile: string
+}
+
+const PNG_SIG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
+/**
+ * Only a frame written by this exact extraction may become evidence: a stale PNG at the same deterministic
+ * name, or a zero-byte "successful" decode, must never be reported as the requested frame.
+ */
+export function commitFrame(tmp: string, file: string): void {
+  const png = readFileSync(tmp)
+  if (png.length < 24 || !png.subarray(0, 8).equals(PNG_SIG)) throw new Error('没有生成新的有效PNG')
+  renameSync(tmp, file)
+}
+
+/** Native screenrecord v2 maps monotonic nanoseconds to device wall time, not host spawn time. */
+export function nativeFrameEpochs(bytes: Buffer, pts: number[]): number[] {
+  const at = bytes.indexOf('#VV1NSC0PET1ME2#')
+  if (at < 0 || at + 32 > bytes.length || bytes.readUInt32LE(at + 16) !== 2) throw new Error('缺少受支持的原生帧时间元数据')
+  const count = bytes.readUInt32LE(at + 28)
+  if (!count || count !== pts.length || at + 32 + count * 8 > bytes.length) throw new Error('原生帧时间数量或长度不匹配')
+  const offset = bytes.readBigInt64LE(at + 20)
+  const epochs = pts.map((_, i) => Number(bytes.readBigInt64LE(at + 32 + i * 8) + offset) / 1e6)
+  if (epochs.some((t, i) => !Number.isFinite(t) || !Number.isFinite(pts[i]) || (i > 0 && (t <= epochs[i - 1]! || pts[i]! <= pts[i - 1]!)) || Math.abs((t - epochs[0]!) / 1000 - (pts[i]! - pts[0]!)) > 0.001)) throw new Error('原生帧时间与视频时间不一致')
+  return epochs
+}
+export function debugClockBounds(start?: DebugClock, end?: DebugClock): DebugClock | undefined {
+  if (!start || !end || Math.max(start.minOffsetMs, end.minOffsetMs) > Math.min(start.maxOffsetMs, end.maxOffsetMs)) return
+  return { minOffsetMs: Math.min(start.minOffsetMs, end.minOffsetMs), maxOffsetMs: Math.max(start.maxOffsetMs, end.maxOffsetMs) }
+}
+export function selectDebugFrame(epochs: number[], clock: DebugClock, target: number, kind: 'pre' | 'post' | 'sample'): number {
+  // Pre and post are one-sided: an action after the last presented frame still has a valid pre frame.
+  if (kind === 'pre') return epochs.findLastIndex(t => t + clock.maxOffsetMs <= target)
+  return epochs.findIndex(t => t + clock.minOffsetMs >= target)
 }
 
 export interface ClaimInfo {
@@ -89,6 +136,7 @@ export interface DeviceView {
 export interface ActRequest {
   action: 'tap' | 'swipe' | 'key' | 'text' | 'scroll' | 'back' | 'home' | 'recents' | 'volume_up' | 'volume_down' | 'rotate'
   serial?: string
+  coordinateSpace?: 'stream' | 'physical'
   x?: number
   y?: number
   x2?: number
@@ -125,7 +173,13 @@ export class PaneHub {
   private readonly streamErrors = new Map<string, string>()
   private readonly busyUntil = new Map<string, number>()
   private readonly pollSince = new Map<string, number>()
-  private readonly records = new Map<string, { proc: ChildProcess; file: string }>()
+  private readonly records = new Map<string, { proc: ChildProcess | null; file: string; id: string; dir: string; startedAt: number; stoppedAt?: number; status: 'recording' | 'pending-save'; error?: string; captureError?: string; saving?: Promise<string | undefined> }>()
+  // ponytail: one host-wide capture; use per-device API slots if simultaneous captures are required.
+  private captureStarting = false
+  private captureWrites = 0
+  private disposed = false
+  private muteQueue: Promise<unknown> = Promise.resolve()
+  private readonly captureProcesses = new WeakMap<ChildProcess, { ready: Promise<string>; closed: Promise<number | null>; stderr: string; pid?: string; done: boolean; error?: string }>()
   private readonly deviceInfo = new Map<string, { brand: string; market: string; model: string; type: string }>()
   /** attach 时切换到 ADBKeyboard 前的原输入法（detach 时还原） */
   private readonly prevIme = new Map<string, string>()
@@ -158,6 +212,44 @@ export class PaneHub {
     },
   ) {
     mkdirSync(this.opts.shotsDir, { recursive: true })
+    for (const job of state.data.pending) {
+      const error = job.error ?? '服务重载，采集已转待保存；请重试保存（先结束可能仍在运行的设备采集）。'
+      if (job.type === 'record') this.records.set(job.serial, { proc: null, file: job.remote!, ...job, status: 'pending-save', error })
+      else {
+        this.debugSessions.set(job.id, { ...job, captureOptions: '', mode: 'human', stoppedAt: job.stoppedAt ?? Date.now(), segments: job.segments!, acts: job.actions!, recordProc: null, logProc: null, logRing: [], logRingBytes: 0, errFile: join(job.dir, job.id + '-logcat.log'), errStream: null, segIndex: job.segments!.length, shortRotations: 0, rotateTimer: null, logRemote: job.logRemote!, error })
+        this.debugBySerial.set(job.serial, job.id)
+      }
+    }
+  }
+
+  private persistRecord(serial: string): void {
+    const r = this.records.get(serial)!
+    this.state.upsertPending({ id: r.id, type: 'record', serial, dir: r.dir, startedAt: r.startedAt, stoppedAt: r.stoppedAt, remote: r.file, error: r.error, captureError: r.captureError })
+  }
+  private persistDebug(sess: DebugSession): void {
+    this.state.upsertPending({ id: sess.id, type: 'debug', serial: sess.serial, dir: sess.dir, startedAt: sess.startedAt, stoppedAt: sess.stoppedAt, logRemote: sess.logRemote, clockStart: sess.clockStart, clockEnd: sess.clockEnd, segments: sess.segments, actions: sess.acts, error: sess.error, captureError: sess.captureError })
+  }
+  private async stopRecoveredCapture(serial: string, remote: string, signal?: AbortSignal): Promise<void> {
+    // Never replay a persisted PID: stop only the exact generated command still owning this remote file.
+    const command = remote.endsWith('.log') ? 'logcat -v epoch -f ' + remote : 'screenrecord --time-limit ' + (remote.includes('dsh_record-') ? '180 ' : '170 ') + remote
+    const pids = async (): Promise<string[]> => {
+      const ps = await this.adb.runOk(['-s', serial, 'shell', 'ps', '-A', '-o', 'PID,ARGS'], { signal, timeoutMs: 8_000 })
+      return ps.split('\n').flatMap(line => {
+        const match = /^\s*(\d+)\s+(.*)$/.exec(line)
+        if (!match) return []
+        const argv = match[2].trim()
+        if (argv === command || argv === '/system/bin/' + command) return [match[1]] // Earlier pending captures had no size/bitrate options.
+        const words = argv.split(/\s+/), executable = words.shift(), file = words.pop()
+        const limit = remote.includes('dsh_record-') ? 180 : 170
+        return !remote.endsWith('.log') && (executable === 'screenrecord' || executable === '/system/bin/screenrecord') && file === remote && new RegExp('^--size [0-9]+x[0-9]+ --bit-rate [0-9]+ --time-limit ' + limit + '$').test(words.join(' ')) ? [match[1]] : []
+      })
+    }
+    for (const pid of await pids()) await this.adb.runOk(['-s', serial, 'shell', 'kill', '-2', pid], { signal, timeoutMs: 8_000 })
+    const deadline = Date.now() + 15_000
+    while ((await pids()).length) {
+      if (Date.now() >= deadline) throw new Error('重载采集停止超时；原件已保留：' + remote)
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
   }
 
   startTimers(): void {
@@ -242,7 +334,8 @@ export class PaneHub {
     const busy: Record<string, boolean> = {}
     for (const [serial, until] of this.busyUntil) busy[serial] = until > now
     const errors: Record<string, string> = {}
-    for (const [serial, err] of this.streamErrors) errors[serial] = err
+    // A running stream is healthy evidence: do not report a stale error from a previous session.
+    for (const [serial, err] of this.streamErrors) if (this.streams.get(serial)?.running !== true) errors[serial] = err
     const debug: Record<string, { id: string; startedAt: number; mode: string }> = {}
     for (const sess of this.debugSessions.values()) {
       if (sess.stoppedAt == null) debug[sess.serial] = { id: sess.id, startedAt: sess.startedAt, mode: sess.mode }
@@ -317,8 +410,7 @@ export class PaneHub {
     if (!s.startsWith('emulator')) {
       const ime = await this.imeStatus(s, signal).catch(() => ({ installed: false, current: '' }))
       if (ime.installed && ime.current !== 'com.android.adbkeyboard/.AdbIME') {
-        await this.adb.shellOk(s, 'ime set com.android.adbkeyboard/.AdbIME', { signal, timeoutMs: 8_000 }).catch(() => undefined)
-        this.prevIme.set(s, ime.current)
+        await this.activateIme(s, ime.current, signal)
         this.opts.log(`[${s}] IME → ADBKeyboard（原: ${ime.current}）`)
       }
     }
@@ -358,8 +450,7 @@ export class PaneHub {
       await this.adb.shell(s, 'wm dismiss-keyguard', { signal, timeoutMs: 5_000 }).catch(() => undefined)
       const ime = await this.imeStatus(s, signal).catch(() => ({ installed: false, current: '' }))
       if (ime.installed && ime.current !== 'com.android.adbkeyboard/.AdbIME') {
-        await this.adb.shellOk(s, 'ime set com.android.adbkeyboard/.AdbIME', { signal, timeoutMs: 8_000 }).catch(() => undefined)
-        this.prevIme.set(s, ime.current)
+        await this.activateIme(s, ime.current, signal)
       }
     }
     await this.ensureStream(s, signal)
@@ -454,6 +545,8 @@ export class PaneHub {
         }
         this.lastDims.set(s, { sw: meta.streamWidth, sh: meta.streamHeight, dw: session.displayDim.w, dh: session.displayDim.h })
         session.onDead((reason) => {
+          // A replaced session may die after its successor started: never evict or flag the live one.
+          if (this.streams.get(s) !== session) return
           this.streamErrors.set(s, reason)
           this.streams.delete(s)
           this.modes.delete(s)
@@ -506,7 +599,7 @@ export class PaneHub {
     }
     this.modes.delete(serial)
     const rec = this.records.get(serial)
-    if (rec != null) void this.stopRecord(serial).catch(() => undefined)
+    if (rec != null) void this.stopRecord(serial).catch(e => this.opts.log('停止录屏失败：' + String(e)))
     this.opts.log(`[${serial}] claim released: ${reason}`)
   }
 
@@ -742,6 +835,8 @@ export class PaneHub {
    *  紧急接管：面板「强制解锁」按钮（POST /claim/release）或该会话 detach/闲置自动释放。 */
   async actPanel(req: ActRequest, signal?: AbortSignal): Promise<{ serial: string; performed: string }> {
     const serial = req.serial
+    if (req.coordinateSpace != null && req.coordinateSpace !== 'stream' && req.coordinateSpace !== 'physical') throw Object.assign(new Error('coordinateSpace 须为 stream|physical'), { code: 'bad-request' })
+    if (req.coordinateSpace === 'physical' && (req.action !== 'tap' || !Number.isFinite(req.x) || !Number.isFinite(req.y) || req.x! < 0 || req.y! < 0 || req.x! > 65535 || req.y! > 65535)) throw Object.assign(new Error('physical 仅允许有效物理坐标的 tap'), { code: 'bad-request' })
     if (serial == null || serial === '') throw new Error('面板操作需要 serial')
     this.assertPanelAvailable(serial)
     // 自愈（同 agent act 路径 B2 教训——人点面板同样需要）：流不在时先尝试恢复，避免静默掉 adb 慢路径
@@ -782,7 +877,7 @@ export class PaneHub {
     stream.injectPanelInput(input)
     const dbg = this.debugSessions.get(this.debugBySerial.get(serial) ?? '')
     const performed = 'input(' + input.events.map(e => e.p).join(',') + ')|ctl'
-    if (dbg != null && dbg.stoppedAt == null) dbg.acts.push({ t: Date.now(), action: 'input', detail: performed })
+    if (dbg != null && dbg.stoppedAt == null) { dbg.acts.push({ t: Date.now(), action: 'input', detail: performed }); this.persistDebug(dbg) }
     return { serial, performed }
   }
 
@@ -821,9 +916,27 @@ export class PaneHub {
       throw new Error('调试会话进行中（人操作模式）——AI 请勿注入干扰；如需接管先停止调试会话')
     }
     if (via === 'agent') this.streams.get(s)?.cancelPanelTouch()
-    const performed = await this.performActInner(s, req, signal, via)
-    if (dbg != null && dbg.stoppedAt == null) dbg.acts.push({ t: Date.now(), action: req.action, detail: performed })
-    return performed
+    const act: DebugAct | undefined = dbg != null && dbg.stoppedAt == null ? { t: Date.now(), action: req.action } : undefined
+    let completed: (() => void) | undefined
+    let pending: Promise<void> | undefined
+    if (act != null) {
+      dbg!.acts.push(act); this.persistDebug(dbg!)
+      pending = new Promise<void>(resolve => { completed = resolve })
+      ;(dbg!.pendingActions ??= new Set()).add(pending)
+    }
+    try {
+      const performed = await this.performActInner(s, req, signal, via)
+      if (act != null) act.detail = performed
+      return performed
+    } catch (e) {
+      if (act != null) act.detail = 'FAILED: ' + String(e instanceof Error ? e.message : e)
+      throw e
+    } finally {
+      if (act != null) {
+        act.endedAt = Date.now(); completed!(); dbg!.pendingActions!.delete(pending!)
+        if (!dbg!.saved && !this.disposed) this.persistDebug(dbg!)
+      }
+    }
   }
 
   private async performActInner(s: string, req: ActRequest, signal?: AbortSignal, via: 'agent' | 'panel' = 'agent'): Promise<string> {
@@ -837,7 +950,7 @@ export class PaneHub {
           stream!.injectTouch(x, y, ACTION_DOWN)
           stream!.injectTouch(x, y, ACTION_UP)
         } else {
-          const p = via === 'panel' ? this.adbPoint(s, x, y) : { x, y }
+          const p = via === 'panel' && req.coordinateSpace !== 'physical' ? this.adbPoint(s, x, y) : { x, y }
           await this.adb.shellOk(s, `input tap ${p.x} ${p.y}`, { signal, timeoutMs: 10_000 })
         }
         return `tap(${x},${y})${PaneHub.TOUCH_VIA_CONTROL && h264 ? '|ctl' : '|adb'}`
@@ -928,8 +1041,17 @@ export class PaneHub {
     return { installed, current: cur }
   }
 
-  /** 中文等非 ASCII 文本：ADBKeyboard 已在 attach 时激活，直接广播注入。 */
+  private async activateIme(s: string, previous: string, signal?: AbortSignal): Promise<void> {
+    // Installed does not mean enabled: Android refuses to select a disabled input method.
+    await this.adb.shellOk(s, 'ime enable com.android.adbkeyboard/.AdbIME', { signal, timeoutMs: 8_000 })
+    await this.adb.shellOk(s, 'ime set com.android.adbkeyboard/.AdbIME', { signal, timeoutMs: 8_000 })
+    if ((await this.imeStatus(s, signal)).current !== 'com.android.adbkeyboard/.AdbIME') throw new Error('ADBKeyboard 激活回读失败，不能保证中文输入')
+    if (!this.prevIme.has(s)) this.prevIme.set(s, previous)
+  }
+
+  /** Input method must still be active; never report a broadcast to an inactive IME as typed text. */
   async imeSend(s: string, text: string, signal?: AbortSignal): Promise<string> {
+    if ((await this.imeStatus(s, signal)).current !== 'com.android.adbkeyboard/.AdbIME') throw new Error('ADBKeyboard 未激活，中文未发送；重新连接设备后再聚焦输入框')
     const escaped = text.replace(/'/g, "'\\''")
     await this.adb.shellOk(s, `am broadcast -a ADB_INPUT_TEXT --es msg '${escaped}'`, { signal, timeoutMs: 10_000 })
     await new Promise((r) => setTimeout(r, 350))
@@ -961,11 +1083,121 @@ export class PaneHub {
     return `rotate→user_rotation=${next}`
   }
 
+  captureState() {
+    const state = this.state.reload()
+    const rec = [...this.records.entries()][0]
+    const dbg = [...this.debugBySerial.values()].map(id => this.debugSessions.get(id)).find(s => s != null)
+    return {
+      directory: this.state.data.directory,
+      record: rec == null ? null : { serial: rec[0], startedAt: rec[1].startedAt, stoppedAt: rec[1].stoppedAt, status: rec[1].status, ...(rec[1].error ? { error: rec[1].error } : {}) },
+      debug: dbg == null ? null : { id: dbg.id, serial: dbg.serial, startedAt: dbg.startedAt, stoppedAt: dbg.stoppedAt, status: this.debugCapturing(dbg) ? 'recording' as const : 'pending-save' as const, ...(dbg.error ? { error: dbg.error } : {}) },
+      outputs: this.state.data.outputs.map(({ identities: _identities, ...output }) => output),
+      muted: Object.fromEntries(Object.keys(state.volumeRestore).map(serial => [serial, true])),
+    }
+  }
+
+  private debugCapturing(sess: DebugSession): boolean {
+    return sess.stoppedAt == null || [sess.recordProc, sess.logProc].some(proc => proc != null && !this.captureProcesses.get(proc)?.done)
+  }
+
+  setCaptureDirectory(directory: string): void {
+    if (this.captureStarting || this.captureWrites > 0 || [...this.records.values()].some(r => r.status === 'recording') || [...this.debugBySerial.values()].some(id => { const sess = this.debugSessions.get(id); return sess != null && this.debugCapturing(sess) })) {
+      throw Object.assign(new Error('采集或保存中不能修改目录；停止后保存失败可修改并重试'), { code: 'capture-busy' })
+    }
+    this.state.setDirectory(directory)
+  }
+
+  async capturePanel(serial: string, type: 'screenshot' | 'record' | 'debug' | 'mute', action?: 'start' | 'stop'): Promise<void> {
+    this.assertPanelAvailable(serial)
+    const device = (await this.ensureDevices()).find(d => d.serial === serial && d.state === 'device')
+    if (device == null) throw new Error('设备不在线：' + serial)
+    this.assertPanelAvailable(serial)
+    if (type === 'screenshot') await this.saveScreenshot(serial)
+    else if (type === 'record') await this.record(serial, action!)
+    else if (type === 'debug') {
+      if (action === 'stop') await this.debugStop(serial)
+      else {
+        const { id } = await this.debugStart(serial, 'human')
+        const sess = this.debugSessions.get(id)!
+        try { await Promise.all([this.captureReady(sess.recordProc!), this.captureReady(sess.logProc!)]) }
+        catch (e) {
+          sess.error = String(e instanceof Error ? e.message : e)
+          await this.debugStop(serial).catch(() => undefined)
+          throw e
+        }
+      }
+    } else await this.toggleMute(serial)
+  }
+
+  private async toggleMute(serial: string): Promise<void> {
+    const work = this.muteQueue.then(async () => {
+      if (this.disposed) throw new Error('采集服务已关闭')
+      this.assertPanelAvailable(serial)
+      const read = async (): Promise<number> => {
+        const out = await this.adb.runOk(['-s', serial, 'shell', 'cmd', 'media_session', 'volume', '--stream', '3', '--get'], { timeoutMs: 8_000 })
+        const match = /volume is (\d+)/i.exec(out)
+        if (match == null) throw new Error('无法读取媒体音量（stream 3）：' + out.slice(0, 200))
+        return Number(match[1])
+      }
+      const current = await read()
+      this.assertPanelAvailable(serial)
+      const previous = this.state.reload().volumeRestore[serial]
+      const desired = previous ?? 0
+      // Persist restoration intent before changing the device, including an original volume of zero.
+      if (previous == null) this.state.setVolumeRestore(serial, current)
+      try {
+        await this.adb.runOk(['-s', serial, 'shell', 'cmd', 'media_session', 'volume', '--stream', '3', '--set', String(desired)], { timeoutMs: 8_000 })
+        if (await read() !== desired) throw new Error('设备媒体音量回读与目标不一致；静音状态未改变')
+      } catch (e) {
+        // A write may have reached the device even when its acknowledgment/readback failed.
+        try {
+          await this.adb.runOk(['-s', serial, 'shell', 'cmd', 'media_session', 'volume', '--stream', '3', '--set', String(current)], { timeoutMs: 8_000 })
+          if (await read() !== current) throw new Error('媒体音量回滚回读失败')
+          if (previous == null) this.state.setVolumeRestore(serial)
+        } catch (err) { this.opts.log('媒体音量失败后还原失败，已保留恢复意图：' + String(err)) }
+        throw e
+      }
+      if (previous != null) this.state.setVolumeRestore(serial) // Original zero is a valid restore target.
+    })
+    this.muteQueue = work.catch(() => undefined)
+    await work
+  }
+
+  captureFile(id: string, index: number): { file: string; dev: number; ino: number } {
+    const output = this.state.data.outputs.find(o => o.id === id)
+    const file = output?.files[index]
+    const identity = output?.identities[index]
+    if (file == null || identity == null || !Number.isSafeInteger(index) || index < 0) throw Object.assign(new Error('未登记的保存文件'), { code: 'not-found' })
+    const stat = lstatSync(file)
+    if (!stat.isFile() || realpathSync(file) !== file || stat.dev !== identity.dev || stat.ino !== identity.ino) throw Object.assign(new Error('保存文件已被替换或不是普通文件'), { code: 'not-found' })
+    return { file, ...identity }
+  }
+
+  private activeDirectory(): string {
+    return [...this.records.values()][0]?.dir ?? [...this.debugBySerial.values()].map(id => this.debugSessions.get(id)?.dir).find(d => d != null) ?? this.state.data.directory
+  }
+
   async saveScreenshot(serial: string, signal?: AbortSignal): Promise<string> {
-    const png = await this.adb.screencap(serial, { signal })
-    const file = join(this.opts.shotsDir, `${Date.now()}-${serial.replace(/[^A-Za-z0-9._-]/g, '_')}.png`)
-    writeFileSync(file, png)
-    return file
+    this.captureWrites++
+    const id = 'shot-' + randomUUID()
+    let tmp: string | undefined
+    try {
+      const dir = validateCaptureDirectory(this.activeDirectory())
+      const secure = await this.checkSecure(serial, signal)
+      if (secure.secure && secure.captureVisible !== true) throw new Error('受保护页面不可截图：截图通道为黑屏，请改用内容大纲')
+      const png = await this.adb.screencap(serial, { signal })
+      if (this.disposed) throw new Error('采集服务已关闭；截图未保存')
+      if (png.length < 24 || !png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) throw new Error('设备未返回有效 PNG；截图未保存')
+      const file = join(dir, id + '.png')
+      tmp = file + '.tmp'
+      writeFileSync(tmp, png, { flag: 'wx', mode: 0o600 })
+      renameSync(tmp, file)
+      this.state.registerOutput(id, 'screenshot', [file])
+      return file
+    } finally {
+      if (tmp != null) try { unlinkSync(tmp) } catch { /* already renamed */ }
+      this.captureWrites--
+    }
   }
 
   async screenshotBuffer(serial: string, signal?: AbortSignal): Promise<Buffer> {
@@ -1022,41 +1254,152 @@ export class PaneHub {
     return nodes
   }
 
-  /** 停止录制并 pull 出 mp4（幂等）。 */
+  private async nativeCaptureOptions(serial: string, signal?: AbortSignal): Promise<string> {
+    const { maxSize, videoBitRate } = this.state.data.quality
+    if (!Number.isSafeInteger(maxSize) || maxSize < 128 || maxSize > 4096 || !Number.isSafeInteger(videoBitRate) || videoBitRate < 1) throw new Error('录制画质参数无效')
+    const png = await this.adb.screencap(serial, { signal })
+    if (png.length < 24 || !png.subarray(0, 8).equals(PNG_SIG)) throw new Error('无法读取录制画面尺寸')
+    const w = png.readUInt32BE(16), height = png.readUInt32BE(20)
+    if (!w || !height) throw new Error('设备录制画面尺寸无效')
+    const scale = Math.min(1, maxSize / Math.max(w, height))
+    // Use existing quality bounds, not native screenrecord's full-size/high-refresh default.
+    return '--size ' + Math.max(8, Math.round(w * scale / 8) * 8) + 'x' + Math.max(8, Math.round(height * scale / 8) * 8) + ' --bit-rate ' + videoBitRate + ' '
+  }
+
+  /** Only generated remote paths enter this command; host directories never enter a shell. */
+  private spawnCapture(serial: string, command: string): ChildProcess {
+    if (this.disposed) throw new Error('采集服务已关闭')
+    const proc = spawn(this.adb.path, ['-s', serial, 'shell', 'echo $$; exec ' + command], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+    let resolveReady!: (pid: string) => void, rejectReady!: (e: Error) => void, resolveClosed!: (code: number | null) => void
+    const ready = new Promise<string>((yes, no) => { resolveReady = yes; rejectReady = no })
+    const closed = new Promise<number | null>(yes => { resolveClosed = yes })
+    const info = { ready, closed, stderr: '', done: false, pid: undefined as string | undefined, error: undefined as string | undefined }
+    this.captureProcesses.set(proc, info)
+    void ready.catch(() => undefined) // Startup and finalization both consume this promise.
+    const timer = setTimeout(() => rejectReady(new Error('采集进程启动超时：' + serial)), 8_000)
+    let output = ''
+    proc.stdout?.on('data', (data: Buffer) => {
+      if (info.pid != null) return
+      output += data.toString('utf8')
+      const match = /^(\d+)\r?\n/.exec(output)
+      if (match != null) { info.pid = match[1]; clearTimeout(timer); resolveReady(match[1]) }
+    })
+    proc.stderr?.on('data', (data: Buffer) => { info.stderr = (info.stderr + data.toString('utf8')).slice(-4000) })
+    proc.once('error', e => { info.error = e.message; rejectReady(e) })
+    proc.once('close', code => {
+      info.done = true; clearTimeout(timer)
+      rejectReady(new Error('采集进程未启动：' + (info.error ?? info.stderr)))
+      resolveClosed(code)
+    })
+    return proc
+  }
+  private async captureReady(proc: ChildProcess): Promise<void> {
+    const info = this.captureProcesses.get(proc)!
+    await info.ready
+    await new Promise(resolve => setTimeout(resolve, 250))
+    if (info.done || info.error) throw new Error('设备采集启动失败：' + (info.error ?? info.stderr))
+  }
+  private async stopCaptureProcess(serial: string, proc: ChildProcess, signal?: AbortSignal): Promise<void> {
+    const info = this.captureProcesses.get(proc)!
+    if (info.done) return
+    const pid = await info.ready
+    // Native SIGINT writes the MP4 trailer; the old SIGKILL path lost frames/trailers.
+    await this.adb.runOk(['-s', serial, 'shell', 'kill', '-2', pid], { signal, timeoutMs: 8_000 })
+    let timer: NodeJS.Timeout | undefined
+    try { await Promise.race([info.closed, new Promise<never>((_, no) => { timer = setTimeout(() => no(new Error('设备采集停止超时：' + serial)), 15_000) })]) }
+    finally { if (timer != null) clearTimeout(timer) }
+  }
+  private async pullCapture(serial: string, remote: string, file: string, signal?: AbortSignal, allowEmpty = false): Promise<boolean> {
+    const tmp = file + '.' + randomUUID() + '.tmp'
+    try {
+      await this.adb.runOk(['-s', serial, 'pull', remote, tmp], { signal, timeoutMs: 120_000 })
+      if (this.disposed) throw new Error('采集服务已重载；设备原件已保留，请在当前面板重试保存')
+      const stat = lstatSync(tmp)
+      if (stat.isFile() && stat.size === 0 && allowEmpty) return false
+      if (!stat.isFile() || stat.size === 0) throw new Error('设备采集文件为空：' + remote)
+      if (file.endsWith('.mp4')) {
+        const fd = openSync(tmp, 'r'), header = Buffer.alloc(16), atoms = new Set<string>()
+        try {
+          // ponytail: MP4 container/trailer check only; use ffprobe if codec-level validation is required.
+          for (let offset = 0; offset < stat.size;) {
+            if (readSync(fd, header, 0, 8, offset) !== 8) throw new Error('录屏 MP4 头被截断：' + remote)
+            let size = header.readUInt32BE(0)
+            const headerSize = size === 1 ? 16 : 8
+            if (size === 1) { if (readSync(fd, header, 8, 8, offset + 8) !== 8) throw new Error('录屏 MP4 大文件头被截断'); size = Number(header.readBigUInt64BE(8)) }
+            if (size === 0) size = stat.size - offset
+            if (!Number.isSafeInteger(size) || size < headerSize || offset + size > stat.size) throw new Error('录屏 MP4 文件不完整：' + remote)
+            atoms.add(header.toString('ascii', 4, 8)); offset += size
+          }
+          if (!['ftyp', 'mdat', 'moov'].every(atom => atoms.has(atom))) throw new Error('录屏 MP4 未完成封装：' + remote)
+        } finally { closeSync(fd) }
+      }
+      renameSync(tmp, file)
+      return true
+    } finally { try { unlinkSync(tmp) } catch { /* moved or not created */ } }
+  }
   private async stopRecord(serial: string, outDir?: string, signal?: AbortSignal): Promise<string | undefined> {
     const rec = this.records.get(serial)
     if (rec == null) return undefined
-    this.records.delete(serial)
-    rec.proc.kill('SIGKILL')
-    await new Promise((r) => setTimeout(r, 800))
-    const dir = outDir ?? this.opts.shotsDir
-    mkdirSync(dir, { recursive: true })
-    const local = join(dir, `dsh-record-${Date.now()}-${serial.replace(/[^A-Za-z0-9._-]/g, '_')}.mp4`)
-    await this.adb.runOk(['-s', serial, 'pull', rec.file, local], { signal, timeoutMs: 30_000 })
-    await this.adb.shell(serial, `rm -f ${rec.file}`, { timeoutMs: 5_000 }).catch(() => undefined)
-    return local
+    if (rec.saving != null) return rec.saving
+    const retry = rec.status === 'pending-save'
+    this.captureWrites++
+    rec.saving = (async () => {
+      try {
+        if (rec.proc == null) await this.stopRecoveredCapture(serial, rec.file, signal)
+        else await this.stopCaptureProcess(serial, rec.proc, signal)
+        if (this.disposed) throw new Error('采集服务已重载，请在当前面板重试保存')
+        rec.status = 'pending-save'; rec.stoppedAt ??= Date.now(); this.persistRecord(serial)
+        const dir = validateCaptureDirectory(retry ? (outDir ?? this.state.data.directory) : rec.dir)
+        const local = join(dir, rec.id + '.mp4')
+        await this.pullCapture(serial, rec.file, local, signal)
+        this.state.registerOutput(rec.id, 'record', [local], rec.captureError)
+        this.records.delete(serial)
+        if (!this.disposed) await this.adb.run(['-s', serial, 'shell', 'rm', '-f', rec.file], { timeoutMs: 5_000 }).catch(e => this.opts.log('设备原片清理失败：' + String(e)))
+        return local
+      } catch (e) { rec.error = String(e instanceof Error ? e.message : e); if (rec.proc == null || this.captureProcesses.get(rec.proc)?.done) rec.status = 'pending-save'; if (!this.disposed) this.persistRecord(serial); throw e }
+      finally { rec.saving = undefined; this.captureWrites-- }
+    })()
+    return rec.saving
   }
-
   async record(serial: string, action: 'start' | 'stop', outDir?: string, signal?: AbortSignal): Promise<{ file?: string; note: string }> {
     if (action === 'start') {
-      if (this.debugBySerial.has(serial)) throw new Error('调试会话进行中——录屏由调试会话托管（停止调试会话即出 mp4）')
+      if (this.disposed || this.captureStarting || this.captureWrites > 0) throw Object.assign(new Error('采集服务正忙或已关闭'), { code: 'capture-busy' })
+      if (this.debugBySerial.size > 0) throw Object.assign(new Error('存在调试或待保存会话——先停止并保存'), { code: 'capture-busy' })
       const existing = this.records.get(serial)
-      if (existing != null) return { note: '已在录制中（screenrecord 最长 180 秒自动停止）' }
-      const remote = '/data/local/tmp/dsh_screenrecord.mp4'
-      const proc = spawn(this.adb.path, ['-s', serial, 'shell', `screenrecord --time-limit 180 ${remote}`], {
-        stdio: 'ignore',
-        windowsHide: true,
-      })
-      this.records.set(serial, { proc, file: remote })
-      proc.on('exit', () => {
-        /* 时间到自动退出；stop 时再 pull */
-      })
-      if (signal != null) signal.addEventListener('abort', () => proc.kill('SIGKILL'), { once: true })
-      return { note: '录制已开始（最长 180 秒）' }
+      if (existing?.status === 'recording') return { note: '已在录制中（最长 180 秒）' }
+      if (this.records.size > 0) throw Object.assign(new Error('存在录屏或待保存记录——先停止并保存'), { code: 'capture-busy' })
+      this.captureStarting = true
+      try {
+        const dir = validateCaptureDirectory(outDir ?? this.state.data.directory)
+        // Screenshot visibility does not prove Android screenrecord can capture a protected window.
+        if ((await this.checkSecure(serial, signal)).secure) throw new Error('受保护页面不能开始普通录屏；调试可继续，但视频可能黑屏')
+        const id = 'record-' + randomUUID(), remote = '/data/local/tmp/dsh_' + id + '.mp4'
+        const options = await this.nativeCaptureOptions(serial, signal)
+        const rec = { proc: null as ChildProcess | null, file: remote, id, dir, startedAt: Date.now(), status: 'recording' as 'recording' | 'pending-save', error: undefined as string | undefined, captureError: undefined as string | undefined, saving: undefined as Promise<string | undefined> | undefined }
+        this.state.upsertPending({ id, type: 'record', serial, dir, startedAt: rec.startedAt, remote })
+        this.records.set(serial, rec)
+        const proc = this.spawnCapture(serial, 'screenrecord ' + options + '--time-limit 180 ' + remote)
+        rec.proc = proc
+        proc.once('close', code => {
+          if (rec.status !== 'recording') return
+          if (code !== 0 && rec.saving == null) rec.captureError = '设备录屏提前结束：' + (this.captureProcesses.get(proc)?.stderr ?? String(code))
+          void this.stopRecord(serial).catch(e => this.opts.log('自动保存录屏失败：' + String(e)))
+        })
+        if (signal != null) {
+          const abort = () => { void this.stopRecord(serial).catch(e => this.opts.log('取消录屏保存失败：' + String(e))) }
+          if (signal.aborted) abort()
+          else { signal.addEventListener('abort', abort, { once: true }); proc.once('close', () => signal.removeEventListener('abort', abort)) }
+        }
+        await this.captureReady(proc)
+        return { note: '录制已开始（最长 180 秒，届时宿主自动保存）' }
+      } catch (e) {
+        const rec = this.records.get(serial)
+        if (rec != null) { rec.error = String(e instanceof Error ? e.message : e); void this.stopRecord(serial).catch(err => this.opts.log('启动失败后保存录屏失败：' + String(err))) }
+        throw e
+      } finally { this.captureStarting = false }
     }
     const file = await this.stopRecord(serial, outDir, signal)
-    if (file == null) return { note: '当前没有进行中的录制' }
-    return { file, note: '已保存' }
+    return file == null ? { note: '当前没有进行中的录制' } : { file, note: '已保存' }
   }
 
   /** 元素级操作基础：按条件在 uiautomator 树里找节点（权威坐标，杜绝截图目测打偏）。 */
@@ -1134,133 +1477,150 @@ export class PaneHub {
   private debugSessions = new Map<string, DebugSession>()
   private debugBySerial = new Map<string, string>()
 
-  debugStart(serial: string, mode: 'human' | 'agent', signal?: AbortSignal): { id: string; note: string } {
+  async debugStart(serial: string, mode: 'human' | 'agent', signal?: AbortSignal): Promise<{ id: string; note: string }> {
     const existingId = this.debugBySerial.get(serial)
-    if (existingId != null) return { id: existingId, note: '调试会话已在进行中' }
-    if (this.records.has(serial)) throw new Error('普通录屏进行中——先停止录屏再开调试会话（两者共用设备端 screenrecord）')
-    // human 模式 = 人操作调试：若当前会话持有认领锁，自动释放（否则全程锁会把人挡在面板外）
-    if (mode === 'human' && this.claims.has(serial)) this.releaseClaim(serial, '人操作调试会话开始，自动释放认领')
-    const id = `dbg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
-    const dir = join(this.opts.shotsDir, 'debug', id)
-    mkdirSync(dir, { recursive: true })
-    const sess: DebugSession = {
-      id, serial, mode, startedAt: Date.now(), segments: [], recordProc: null,
-      logProc: null, logRing: [], logRingBytes: 0,
-      errFile: join(dir, 'logcat-errors.log'), errStream: null, acts: [], segIndex: 0, shortRotations: 0, rotateTimer: null, dir,
+    if (existingId != null) {
+      const sess = this.debugSessions.get(existingId)!
+      if (sess.stoppedAt != null) throw Object.assign(new Error('调试已停止，保存失败；请停止按钮重试保存'), { code: 'capture-busy' })
+      return { id: existingId, note: '调试会话已在进行中' }
     }
+    if (this.disposed || this.captureStarting || this.captureWrites > 0 || this.records.size > 0 || this.debugBySerial.size > 0) throw Object.assign(new Error('已有采集或待保存记录——先停止并保存'), { code: 'capture-busy' })
+    if (mode === 'human') this.assertPanelAvailable(serial) // No implicit release of an agent claim.
+    this.captureStarting = true
+    let captureOptions: string
+    let clockStart: DebugClock | undefined
+    try { captureOptions = await this.nativeCaptureOptions(serial, signal); clockStart = await this.sampleDebugClock(serial, signal) }
+    finally { this.captureStarting = false }
+    if (this.disposed) throw new Error('采集服务已关闭')
+    if (mode === 'human') this.assertPanelAvailable(serial)
+    const id = 'dbg-' + randomUUID()
+    const dir = validateCaptureDirectory(this.state.data.directory)
+    const sess: DebugSession = {
+      id, serial, mode, captureOptions, clockStart, startedAt: Date.now(), segments: [], recordProc: null,
+      logProc: null, logRing: [], logRingBytes: 0, errFile: join(dir, id + '-logcat.log'),
+      errStream: null, acts: [], segIndex: 0, shortRotations: 0, rotateTimer: null, dir,
+      logRemote: '/data/local/tmp/dsh_' + id + '-logcat.log',
+    }
+    this.persistDebug(sess)
     this.debugSessions.set(id, sess)
     this.debugBySerial.set(serial, id)
-    this.debugSpawnSegment(sess)
-    this.debugSpawnLogcat(sess)
-    if (signal != null) signal.addEventListener('abort', () => this.debugStop(serial).catch(() => undefined), { once: true })
-    this.opts.log(`[${serial}] 调试会话开始 ${id}（mode=${mode}，录屏分段 170s + logcat 环形缓冲）`)
-    return { id, note: mode === 'human' ? '调试会话已开始（人操作模式）：录屏+日志托管中，放心操作' : '调试会话已开始（agent 操作模式）：录屏（分段）+ logcat + 操作时间线托管中' }
+    try { this.debugSpawnSegment(sess); this.debugSpawnLogcat(sess) }
+    catch (e) { sess.error = String(e); void this.debugStop(serial).catch(err => this.opts.log('调试启动失败：' + String(err))); throw e }
+    if (signal != null) {
+      const abort = () => { void this.debugStop(serial).catch(e => this.opts.log('取消调试保存失败：' + String(e))) }
+      if (signal.aborted) abort()
+      else { signal.addEventListener('abort', abort, { once: true }); sess.logProc?.once('close', () => signal.removeEventListener('abort', abort)) }
+    }
+    return { id, note: '调试已启动：录屏分段、全量 logcat 与操作时间线；受保护页面可能黑屏' }
+  }
+
+  private async sampleDebugClock(serial: string, signal?: AbortSignal): Promise<DebugClock | undefined> {
+    try {
+      const before = Date.now()
+      const out = (await this.adb.runOk(['-s', serial, 'shell', 'date', '+%s%N'], { signal, timeoutMs: 2000 })).trim()
+      const after = Date.now()
+      if (!/^\d{19}$/.test(out) || after < before || after - before > 1000) throw new Error('设备时钟精度或往返时间不可用')
+      const deviceMs = Number(BigInt(out)) / 1e6
+      return { minOffsetMs: before - deviceMs - 1, maxOffsetMs: after - deviceMs + 1 }
+    } catch (e) { this.opts.log('调试时间未校准（仍保留录屏与日志）：' + String(e)); return undefined }
   }
 
   private debugSpawnSegment(sess: DebugSession): void {
-    if (sess.stoppedAt != null) return
-    const segIndex = sess.segIndex++
-    const remote = `/data/local/tmp/dsh_dbg_${sess.id}_${segIndex}.mp4`
-    const startEpoch = Date.now()
-    const proc = spawn(this.adb.path, ['-s', sess.serial, 'shell', `screenrecord --time-limit 170 ${remote}`], { stdio: 'ignore', windowsHide: true })
-    sess.recordProc = proc
-    const seg: DebugSegment = { remote, startEpoch }
+    if (sess.stoppedAt != null || this.disposed) return
+    const remote = '/data/local/tmp/dsh_' + sess.id + '_' + sess.segIndex++ + '.mp4'
+    const seg: DebugSegment = { remote, startEpoch: Date.now() }
     sess.segments.push(seg)
-    proc.on('exit', () => {
+    this.persistDebug(sess)
+    const proc = this.spawnCapture(sess.serial, 'screenrecord ' + sess.captureOptions + '--time-limit 170 ' + remote)
+    sess.recordProc = proc
+    proc.once('close', code => {
       seg.endEpoch = Date.now()
-      if (sess.stoppedAt == null && sess.recordProc === proc) this.debugRotate(sess)
-    })
-    if (sess.rotateTimer == null) {
-      sess.rotateTimer = setInterval(() => {
-        if (sess.stoppedAt != null) return
-        if (sess.recordProc != null) this.debugRotate(sess)
-      }, 165_000)
-    }
-  }
-
-  /** 段轮转：杀当前 screenrecord（设备端自动落盘）→ 异步 pull → 拉起下一段。 */
-  private debugRotate(sess: DebugSession): void {
-    const proc = sess.recordProc
-    sess.recordProc = null
-    proc?.kill('SIGKILL')
-    const seg = sess.segments[sess.segments.length - 1]
-    if (seg != null && seg.endEpoch != null && seg.local == null) void this.debugPullSegment(sess, seg)
-    if (sess.stoppedAt != null) return
-    // ⚠️ 轮转失控防护（实测 288 段事故）：段过短=screenrecord 秒退（设备掉线/编码器被占），
-    // 立即 respawn 会紧循环刷爆磁盘与进程。连续 3 个短段（<20s）→ 自动停会话；单次短段 → 30s 退避再拉起。
-    const dur = seg != null && seg.endEpoch != null ? seg.endEpoch - seg.startEpoch : 999_999
-    if (dur < 20_000) {
-      sess.shortRotations = (sess.shortRotations ?? 0) + 1
-      if (sess.shortRotations >= 3 || sess.segments.length >= 60) {
-        this.opts.log(`[${sess.serial}] 调试会话自动停止：screenrecord 连续秒退（设备掉线/编码器占用）`)
-        void this.debugStop(sess.serial).catch(() => undefined)
-        return
+      try {
+        if (!this.disposed) this.persistDebug(sess)
+        if (sess.stoppedAt != null || this.disposed) return
+        const info = this.captureProcesses.get(proc)!
+        if (code !== 0 || seg.endEpoch - seg.startEpoch < 20_000) throw new Error('设备录屏提前退出：' + (info.error ?? info.stderr ?? String(code)))
+        this.debugSpawnSegment(sess)
+      } catch (e) {
+        sess.captureError = String(e instanceof Error ? e.message : e)
+        void this.debugStop(sess.serial).catch(err => this.opts.log('调试异常停止：' + String(err)))
       }
-      this.opts.log(`[${sess.serial}] screenrecord 段仅 ${Math.round(dur / 1000)}s，30s 退避后再拉起`)
-      setTimeout(() => {
-        if (sess.stoppedAt == null && sess.recordProc == null) this.debugSpawnSegment(sess)
-      }, 30_000)
-      return
-    }
-    sess.shortRotations = 0
-    this.debugSpawnSegment(sess)
-  }
-
-  private async debugPullSegment(sess: DebugSession, seg: DebugSegment): Promise<void> {
-    try {
-      await new Promise((r) => setTimeout(r, 800)) // 设备端 mp4 落盘
-      const local = join(sess.dir, `seg-${String(sess.segments.indexOf(seg)).padStart(3, '0')}.mp4`)
-      await this.adb.runOk(['-s', sess.serial, 'pull', seg.remote, local], { timeoutMs: 30_000 })
-      seg.local = local
-      await this.adb.shell(sess.serial, `rm -f ${seg.remote}`, { timeoutMs: 5_000 }).catch(() => undefined)
-    } catch (e) {
-      this.opts.log(`[${sess.serial}] 调试段 pull 失败: ${String(e).slice(0, 160)}`)
-    }
+    })
   }
 
   private debugSpawnLogcat(sess: DebugSession): void {
-    // ⚠️ 深度定制系统 全量 logcat 实测 1.7 万行/秒（256MB/87s）——*:I 去掉 V/D 洪水；洪水源 tag 随场景变化，
-    // 黑名单追不完 → 架构改为「内存环形缓冲（全保真 ~24MB）+ E 级实时落盘」：磁盘零洪水、事件周边全保真
-    const proc = spawn(this.adb.path, ['-s', sess.serial, 'logcat', '-v', 'threadtime', '*:I'], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
+    // Full logcat lives on the device until successful saving, so a host write failure cannot drop logs.
+    const proc = this.spawnCapture(sess.serial, 'logcat -v epoch -f ' + sess.logRemote)
     sess.logProc = proc
-    const errStream = createWriteStream(sess.errFile, { flags: 'a' })
-    sess.errStream = errStream
-    let buf = ''
-    proc.stdout?.on('data', (d: Buffer) => {
-      buf += d.toString('utf8')
-      const lines = buf.split('\n')
-      buf = lines.pop() ?? ''
-      const now = Date.now()
-      for (const line of lines) {
-        if (line.trim() === '') continue
-        const rec = `${now}\t${line}`
-        sess.logRing.push(rec)
-        sess.logRingBytes += rec.length + 1
-        while (sess.logRingBytes > 24_000_000 && sess.logRing.length > 0) {
-          sess.logRingBytes -= sess.logRing.shift()!.length + 1
-        }
-        if (/\sE\/ /.test(line)) errStream.write(`${rec}\n`)
-      }
+    proc.once('close', code => {
+      if (sess.stoppedAt != null || this.disposed) return
+      sess.captureError = '设备 logcat 提前退出：' + (this.captureProcesses.get(proc)?.stderr ?? String(code))
+      void this.debugStop(sess.serial).catch(e => this.opts.log('日志异常停止：' + String(e)))
     })
-    proc.on('exit', () => errStream.end())
   }
+
+  private async loadDebugLog(sess: DebugSession, file: string): Promise<void> {
+    sess.logRing = []; sess.logRingBytes = 0
+    const input = createReadStream(file, { encoding: 'utf8' })
+    const lines = createInterface({ input, crlfDelay: Infinity })
+    // ponytail: analysis keeps the newest 24MB; prune dead prefixes in batches, never shift every line.
+    // Full unfiltered logcat remains in the saved .log.
+    let first = 0
+    const clock = debugClockBounds(sess.clockStart, sess.clockEnd)
+    const offset = clock ? (clock.minOffsetMs + clock.maxOffsetMs) / 2 : 0
+    for await (const line of lines) {
+      const match = /^\s*(\d+\.\d+)/.exec(line)
+      const rec = (match == null ? sess.startedAt : Math.round(Number(match[1]) * 1000 + offset)) + '\t' + line
+      sess.logRing.push(rec); sess.logRingBytes += Buffer.byteLength(rec) + 1
+      while (sess.logRingBytes > 24_000_000 && first < sess.logRing.length) sess.logRingBytes -= Buffer.byteLength(sess.logRing[first++]!) + 1
+      if (first >= 10_000) { sess.logRing.splice(0, first); first = 0 }
+    }
+    if (first) sess.logRing.splice(0, first)
+  }
+
   async debugStop(serial: string): Promise<{ id: string; note: string; summary?: DebugSummary }> {
     const id = this.debugBySerial.get(serial)
     if (id == null) return { id: '', note: '当前没有进行中的调试会话' }
-    this.debugBySerial.delete(serial)
-    const sess = this.debugSessions.get(id)
-    if (sess == null) return { id, note: '会话记录缺失' }
-    sess.stoppedAt = Date.now()
-    if (sess.rotateTimer != null) clearInterval(sess.rotateTimer)
-    sess.rotateTimer = null
-    sess.recordProc?.kill('SIGKILL')
-    sess.logProc?.kill('SIGKILL')
-    await new Promise((r) => setTimeout(r, 900))
-    for (const seg of sess.segments) if (seg.local == null) await this.debugPullSegment(sess, seg)
-    sess.errStream?.end()
-    const summary = this.debugSummarize(sess)
-    this.opts.log(`[${serial}] 调试会话结束 ${id}：${summary.durationMs}ms，${sess.segments.length} 段，${sess.acts.length} 个操作`)
-    return { id, note: `调试会话已保存：${sess.segments.length} 段录屏 + logcat + ${sess.acts.length} 条操作时间线`, summary }
+    const sess = this.debugSessions.get(id)!
+    if (sess.saving != null) return sess.saving
+    const retry = sess.stoppedAt != null
+    if (sess.rotateTimer != null) { clearTimeout(sess.rotateTimer); sess.rotateTimer = null }
+    sess.stoppedAt ??= Date.now()
+    this.captureWrites++
+    sess.saving = (async () => {
+      try {
+        await Promise.all([...(sess.pendingActions ?? [])])
+        await Promise.all([sess.recordProc == null ? Promise.all(sess.segments.map(seg => this.stopRecoveredCapture(serial, seg.remote))) : this.stopCaptureProcess(serial, sess.recordProc), sess.logProc == null ? this.stopRecoveredCapture(serial, sess.logRemote) : this.stopCaptureProcess(serial, sess.logProc)])
+        if (this.disposed) throw new Error('采集服务已重载，请在当前面板重试保存')
+        if (!retry) sess.clockEnd = await this.sampleDebugClock(serial)
+        this.persistDebug(sess)
+        const dir = validateCaptureDirectory(retry ? this.state.data.directory : sess.dir)
+        const files: string[] = []
+        for (const [index, seg] of sess.segments.entries()) {
+          const file = join(dir, sess.id + '-seg-' + String(index).padStart(3, '0') + '.mp4')
+          if (await this.pullCapture(serial, seg.remote, file, undefined, sess.captureError != null)) { seg.local = file; files.push(file) }
+          else seg.error = '此段采集启动失败，设备原件为空；已保留其余视频与日志'
+        }
+        if (files.length === 0) throw new Error('调试没有录屏段，不能报告保存成功')
+        const log = join(dir, sess.id + '-logcat.log')
+        await this.pullCapture(serial, sess.logRemote, log)
+        await this.loadDebugLog(sess, log)
+        if (this.disposed) throw new Error('采集服务已重载；设备原件已保留，请重试保存')
+        const acts = join(dir, sess.id + '-actions.json'), tmp = acts + '.' + randomUUID() + '.tmp'
+        try {
+          writeFileSync(tmp, JSON.stringify({ id: sess.id, serial, startedAt: sess.startedAt, stoppedAt: sess.stoppedAt, segments: sess.segments, actions: sess.acts, clockStart: sess.clockStart, clockEnd: sess.clockEnd, captureError: sess.captureError }, null, 2), { flag: 'wx', mode: 0o600 })
+          renameSync(tmp, acts)
+        } finally { try { unlinkSync(tmp) } catch { /* moved */ } }
+        files.push(log, acts)
+        this.state.registerOutput(sess.id, 'debug', files, sess.captureError)
+        sess.dir = dir; sess.errFile = log; sess.logLocal = log; sess.saved = true
+        this.debugBySerial.delete(serial)
+        if (!this.disposed) await this.adb.run(['-s', serial, 'shell', 'rm', '-f', ...sess.segments.map(s => s.remote), sess.logRemote], { timeoutMs: 5_000 }).catch(e => this.opts.log('调试原件清理失败：' + String(e)))
+        return { id, note: '调试文件已保存' + (sess.captureError ? '；采集曾异常：' + sess.captureError : ''), summary: this.debugSummarize(sess) }
+      } catch (e) { sess.error = String(e instanceof Error ? e.message : e); if (!this.disposed) this.persistDebug(sess); throw e }
+      finally { sess.saving = undefined; this.captureWrites-- }
+    })()
+    return sess.saving
   }
 
   private debugSummarize(sess: DebugSession): DebugSummary {
@@ -1282,7 +1642,7 @@ export class PaneHub {
       const id = this.debugBySerial.get(serial)
       if (id == null) return { active: false }
       const sess = this.debugSessions.get(id)
-      return { active: true, id, startedAt: sess?.startedAt, mode: sess?.mode, acts: sess?.acts.length }
+      return { active: sess != null && this.debugCapturing(sess), id, startedAt: sess?.startedAt, mode: sess?.mode, acts: sess?.acts.length }
     }
     return { active: false, sessions: [...this.debugSessions.values()].map((s) => this.debugSummarize(s)) }
   }
@@ -1298,65 +1658,91 @@ export class PaneHub {
       [...this.debugSessions.values()].filter((s) => s.stoppedAt != null).sort((a, b) => (b.stoppedAt ?? 0) - (a.stoppedAt ?? 0))[0]
     if (sess == null) throw new Error('没有可分析的调试会话（先 start 并 stop）')
     if (sess.stoppedAt == null) throw new Error('调试会话仍在进行中——先停止再分析')
+    if (!sess.saved) throw new Error('调试尚未完整保存——先重试保存再分析')
     const stoppedAt: number = sess.stoppedAt
     const durationMs = stoppedAt - sess.startedAt
     // 取证窗口：有操作时间线 → 每操作一个窗口；无（纯人手物理操作）→ 均匀采样
-    const windows: Array<{ t: number; label: string }> =
+    const windows: Array<{ t: number; endedAt?: number; label: string }> =
       sess.acts.length > 0
-        ? sess.acts.slice(-12).map((a, i) => ({ t: a.t, label: `#${sess.acts.length - sess.acts.slice(-12).length + i + 1} ${a.action}` }))
+        ? sess.acts.slice(-12).map((a, i) => ({ t: a.t, endedAt: a.endedAt, label: `#${sess.acts.length - sess.acts.slice(-12).length + i + 1} ${a.action}` }))
         : Array.from({ length: Math.max(3, Math.min(8, Math.floor(durationMs / 6000))) }, (_, i) => ({
             t: sess.startedAt + Math.round((durationMs * (i + 1)) / (Math.min(8, Math.max(3, Math.floor(durationMs / 6000))) + 1)),
             label: `采样${i + 1}`,
           }))
-    const framesDir = join(sess.dir, 'frames')
+    const framesDir = join(sess.dir, sess.id + '-frames')
     mkdirSync(framesDir, { recursive: true })
     const { execFile } = await import('node:child_process')
-    const runFfmpeg = (args: string[], timeout = 20_000): Promise<void> =>
+    const runMedia = (bin: string, args: string[]): Promise<string> =>
       new Promise((resolve, reject) => {
-        execFile('ffmpeg', args, { timeout }, (err) => (err == null ? resolve() : reject(err)))
+        execFile(bin, args, { timeout: 20_000, maxBuffer: 16 * 1024 * 1024 }, (err, out) => err == null ? resolve(String(out)) : reject(err))
       })
-    const frames: Array<{ file: string; label: string; t: number; kind: 'pre' | 'post' | 'sample' }> = []
-    for (const [i, w] of windows.entries()) {
-      const seg = sess.segments.find((s) => s.startEpoch <= w.t && w.t <= (s.endEpoch ?? stoppedAt) && s.local != null)
-      if (seg == null || seg.local == null) continue
-      const segLocal: string = seg.local
-      const segEnd: number = seg.endEpoch ?? stoppedAt
-      const inSeg = (epoch: number): number | null => {
-        if (epoch < seg.startEpoch || epoch > segEnd) return null
-        return Math.max(0, (epoch - seg.startEpoch) / 1000)
-      }
-      const targets =
-        sess.acts.length > 0
-          ? [
-              { kind: 'pre' as const, off: inSeg(w.t - 600) },
-              { kind: 'post' as const, off: inSeg(w.t + 1200) },
-            ]
-          : [{ kind: 'sample' as const, off: inSeg(w.t) }]
-      for (const tg of targets) {
-        if (tg.off == null) continue
-        const file = join(framesDir, `f${String(i + 1).padStart(2, '0')}-${tg.kind}.png`)
-        try {
-          await runFfmpeg(['-ss', tg.off.toFixed(2), '-i', segLocal, '-frames:v', '1', '-y', file])
-          frames.push({ file, label: w.label, t: w.t, kind: tg.kind })
-        } catch {
-          /* 单帧失败跳过 */
+    const clock = debugClockBounds(sess.clockStart, sess.clockEnd)
+    const frameIssues: string[] = []
+    if (!clock) frameIssues.push('设备/宿主时钟未校准或已漂移：仅返回视频采样，不能证明操作前后；日志切片不可对齐')
+    const sources: Array<{ seg: DebugSegment; pts: number[]; epochs?: number[] }> = []
+    for (const seg of sess.segments) {
+      if (!seg.local) continue
+      try {
+        const probe = JSON.parse(await runMedia('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'frame=best_effort_timestamp_time', '-of', 'json', seg.local]))
+        const pts: number[] = probe.frames.map((f: { best_effort_timestamp_time?: string }) => Number(f.best_effort_timestamp_time))
+        if (!pts.length || pts.some((t, i) => !Number.isFinite(t) || (i > 0 && t <= pts[i - 1]!))) throw new Error('视频帧时间不可用')
+        const source: typeof sources[number] = { seg, pts }
+        sources.push(source)
+        if (clock) {
+          const size = lstatSync(seg.local).size, fd = openSync(seg.local, 'r')
+          // ponytail: native metadata must fit the final 1MB; stream-scan if future formats exceed it.
+          const bytes = Buffer.alloc(Math.min(size, 1024 * 1024))
+          try { if (readSync(fd, bytes, 0, bytes.length, size - bytes.length) !== bytes.length) throw new Error('元数据读取不完整') }
+          finally { closeSync(fd) }
+          source.epochs = nativeFrameEpochs(bytes, pts)
         }
+      } catch (e) { frameIssues.push((seg.local ?? seg.remote) + '：' + String(e)) }
+    }
+    const frames: DebugAnalysis['frames'] = []
+    const targets: Array<{ source: typeof sources[number]; index: number; t: number; label: string; kind: 'pre' | 'post' | 'sample'; requestedAt?: number }> = []
+    for (const w of windows) {
+      for (const tg of sess.acts.length ? [{ kind: 'pre' as const, epoch: w.t - 600 }, { kind: 'post' as const, epoch: (w.endedAt ?? w.t) + 1200 }] : [{ kind: 'sample' as const, epoch: w.t }]) {
+        const source = sources.find(s => s.epochs && s.seg.startEpoch <= tg.epoch && tg.epoch <= (s.seg.endEpoch ?? stoppedAt))
+        if (!source || !clock) continue
+        const index = selectDebugFrame(source.epochs!, clock, tg.epoch, tg.kind)
+        if (index >= 0) { targets.push({ source, index, t: w.t, label: w.label, kind: tg.kind, requestedAt: tg.epoch }); continue }
+        if (tg.kind === 'pre') { frameIssues.push(w.label + ' pre：录屏早于该操作，没有可证明的"操作前"画面'); continue }
+        // Sparse recordings only carry frames when the screen changes: no frame after the action is itself
+        // evidence that nothing visibly changed. Return the last presented frame, explicitly not as a post frame.
+        frameIssues.push(w.label + ' post：该操作后设备未产生新帧（画面无可见变化），已附最后可见画面')
+        targets.push({ source, index: source.pts.length - 1, t: w.t, label: w.label + '（操作后无新帧）', kind: 'sample' })
       }
     }
-    // logcat 切片：来自内存环形缓冲（全保真最后 ~24MB）；E 级另有磁盘留档 errFile
+    for (const source of sources.filter(s => !s.epochs).slice(-4)) {
+      for (let i = 1; i <= 3; i++) targets.push({ source, index: Math.min(source.pts.length - 1, Math.floor(source.pts.length * i / 4)), t: source.seg.startEpoch, label: '未校准视频采样（不代表操作前后）', kind: 'sample' })
+    }
+    for (const [i, target] of targets.entries()) {
+      const { source, index, kind } = target
+      const file = join(framesDir, 'f' + String(i + 1).padStart(2, '0') + '-' + kind + '.png')
+      const tmp = file + '.' + randomUUID() + '.png'
+      try {
+        // Decode/select the exact probed frame index: input seek would select the next sparse frame.
+        await runMedia('ffmpeg', ['-v', 'error', '-i', source.seg.local!, '-map', '0:v:0', '-vf', 'select=eq(n\\,' + index + ')', '-fps_mode', 'vfr', '-frames:v', '1', '-n', tmp])
+        commitFrame(tmp, file)
+        const calibrated = source.epochs != null && clock != null
+        frames.push({ file, label: target.label, t: target.t, kind, pts: source.pts[index]!, requestedAt: target.requestedAt, timing: calibrated ? 'calibrated' : 'uncalibrated', ...(calibrated ? { frameAt: source.epochs![index]! + (clock!.minOffsetMs + clock!.maxOffsetMs) / 2, uncertaintyMs: (clock!.maxOffsetMs - clock!.minOffsetMs) / 2 } : {}) })
+      } catch (e) { frameIssues.push(target.label + ' ' + kind + '：' + String(e)) }
+      finally { try { unlinkSync(tmp) } catch { /* Only this unique extraction's temporary file. */ } }
+    }
+    // logcat 切片：内存保留最后 ~24MB，完整未过滤日志已保存到 errFile。
     const logLines = sess.logRing.filter((l) => l.includes('\t'))
     const slices: string[] = []
-    for (const w of windows) {
+    for (const w of clock ? windows : []) {
       const inWin = logLines.filter((l) => {
         const e = Number(l.slice(0, l.indexOf('\t')))
-        return Number.isFinite(e) && e >= w.t - 2000 && e <= w.t + 2500
+        return Number.isFinite(e) && e >= w.t - 2000 && e <= (w.endedAt ?? w.t) + 2500
       })
       if (inWin.length > 0) {
-        slices.push(`── ${w.label}（±2s，${inWin.length} 行）──`)
+        slices.push(`── ${w.label}（操作区间前2s/后2.5s，${inWin.length} 行）──`)
         slices.push(...inWin.slice(0, 40))
       }
     }
-    const errLines = logLines.filter((l) => /\s[EF]\/ /.test(l)).slice(-60)
+    const errLines = logLines.filter((l) => /\s[EF]\s/.test(l)).slice(-60)
     const tail = logLines.slice(-50)
     const timeline =
       sess.acts.length > 0
@@ -1368,6 +1754,7 @@ export class PaneHub {
       durationMs,
       timeline,
       frames,
+      frameIssues,
       logSlices: slices.slice(0, 400),
       errorLines: errLines,
       logTail: tail,
@@ -1408,6 +1795,8 @@ export class PaneHub {
   }
 
   async setQuality(patch: Partial<QualityPrefs>): Promise<QualityPrefs> {
+    for (const serial of new Set([...this.claims.keys(), ...this.busyUntil.keys()])) this.assertPanelAvailable(serial)
+    if (this.captureStarting || this.captureWrites || this.records.size || this.debugBySerial.size) throw Object.assign(new Error('采集或待保存时不能重建画质'), { code: 'capture-busy' })
     const q = this.state.setQuality(patch)
     // 对运行中的流重建（scrcpy 不支持热重配）；停流后等待设备端 MediaCodec 释放（实测竞态教训）
     for (const [serial, stream] of [...this.streams]) {
@@ -1436,6 +1825,17 @@ export class PaneHub {
   }
 
   dispose(): void {
+    this.disposed = true
+    void this.muteQueue.then(async () => {
+      for (const [serial, previous] of Object.entries(this.state.reload().volumeRestore)) {
+        try {
+          await this.adb.runOk(['-s', serial, 'shell', 'cmd', 'media_session', 'volume', '--stream', '3', '--set', String(previous)], { timeoutMs: 8_000 })
+          const out = await this.adb.runOk(['-s', serial, 'shell', 'cmd', 'media_session', 'volume', '--stream', '3', '--get'], { timeoutMs: 8_000 })
+          if (Number(/volume is (\d+)/i.exec(out)?.[1]) !== previous) throw new Error('媒体音量还原回读失败')
+          this.state.setVolumeRestore(serial)
+        } catch (e) { this.opts.log('卸载时媒体音量还原失败（' + serial + '）：' + String(e)) }
+      }
+    })
     if (this.refreshTimer != null) clearInterval(this.refreshTimer)
     for (const st of this.pendingStarts) st.stop()
     if (this.secureTimer != null) clearInterval(this.secureTimer)
@@ -1445,15 +1845,20 @@ export class PaneHub {
     for (const [serial] of this.prevIme) this.restoreIme(serial)
     if (this.reaperTimer != null) clearInterval(this.reaperTimer)
     for (const stream of this.streams.values()) stream.stop()
-    for (const rec of this.records.values()) rec.proc.kill('SIGKILL')
+    // Stop natively, retain pending objects and all device originals; unload never deletes captures.
+    for (const [serial, rec] of this.records) {
+      rec.status = 'pending-save'; rec.stoppedAt ??= Date.now()
+      try { this.persistRecord(serial) } catch (e) { this.opts.log('卸载时录屏清单保存失败：' + String(e)) }
+      if (rec.proc != null) void this.stopCaptureProcess(serial, rec.proc).catch(e => this.opts.log('卸载时录屏停止失败：' + String(e)))
+    }
     for (const sess of this.debugSessions.values()) {
       if (sess.rotateTimer != null) clearInterval(sess.rotateTimer)
-      sess.recordProc?.kill('SIGKILL')
-      sess.logProc?.kill('SIGKILL')
+      sess.stoppedAt ??= Date.now()
+      if (!sess.saved) { try { this.persistDebug(sess) } catch (e) { this.opts.log('卸载时调试清单保存失败：' + String(e)) } }
+      for (const proc of [sess.recordProc, sess.logProc]) if (proc != null) void this.stopCaptureProcess(sess.serial, proc).catch(e => this.opts.log('卸载时调试停止失败：' + String(e)))
       sess.errStream?.end()
     }
     this.streams.clear()
-    this.records.clear()
     this.claims.clear()
   }
 }

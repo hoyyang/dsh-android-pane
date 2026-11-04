@@ -1,7 +1,6 @@
 /**
  * dsh-android-pane client：右侧停靠列（margin-right 租约）+ 浮窗降级 + 侧栏入口。
- * 风格：playful-pop × oat-terracotta（Style Studio 拍板 2026-09-04）——胖圆字、2px 描边、
- * 硬阴影 0 3px 0、果冻 hover、磁吸按钮（magnetic-btn）。跑马灯字带已按用户裁定移除。
+ * B28 Graphite Studio：画面优先，统一宿主目录，真实截图/录屏/调试。
  * 两必坑（骨架实测）：apply 用 ctx.slots 必须 export const inject = ['slots']；register 必带 name。
  * 流消费：fetch 流式分帧 [u32 type][u64 pts][u32 len][payload] → WebCodecs VideoDecoder(AnnexB) → canvas；
  * 降级：/stream 不可用（poll 模式）→ <img> 每 600ms 拉 /frame。
@@ -37,6 +36,28 @@ interface DeviceRow {
     mode: 'h264' | 'poll' | null;
 }
 type PaneForm = 'dock' | 'overlay';
+interface CaptureJob {
+    serial: string;
+    startedAt: number;
+    status: 'recording' | 'pending-save';
+    error?: string;
+    id?: string;
+    stoppedAt?: number;
+}
+interface CaptureOutput {
+    id: string;
+    type: 'screenshot' | 'record' | 'debug';
+    files: string[];
+    at: number;
+    error?: string;
+}
+interface CaptureState {
+    directory: string;
+    record: CaptureJob | null;
+    debug: CaptureJob | null;
+    outputs: CaptureOutput[];
+    muted: Record<string, boolean>;
+}
 interface PaneWindowState {
     open: boolean;
     form: PaneForm;
@@ -83,6 +104,19 @@ interface PaneWindowState {
     } | null;
     /** 停靠形态：右侧邻列（卡片详情页）占掉的宽度 —— 面板右边缘让位，排在它左边 */
     dockRight: number;
+    capture: CaptureState | null;
+    captureBusy: boolean;
+    modal: 'directory' | 'settings' | 'outputs' | 'preview' | 'confirm' | null;
+    directoryDraft: string;
+    directoryError: string | null;
+    directoryPickerOpen: boolean;
+    textOpen: boolean;
+    deviceText: string;
+    preview: CaptureOutput | null;
+    previewText: string;
+    confirmTitle: string;
+    confirmText: string;
+    confirmLabel: string;
 }
 export declare class PaneWindow extends Component<Record<string, never>, PaneWindowState> {
     state: PaneWindowState;
@@ -109,8 +143,12 @@ export declare class PaneWindow extends Component<Record<string, never>, PaneWin
     private pref;
     private lease;
     private unwatchNeighbor;
-    private magEl;
-    private magCleanup;
+    private resizeObserver;
+    private dialogRef;
+    private confirmCallback;
+    private directoryPicking;
+    private captureInflight;
+    private captureSettled;
     componentDidMount(): void;
     private removeToggle;
     private onResize;
@@ -118,6 +156,7 @@ export declare class PaneWindow extends Component<Record<string, never>, PaneWin
     componentDidUpdate(): void;
     componentWillUnmount(): void;
     private setOpen;
+    private closeNow;
     /** 停靠租约生命周期：开面板时按 pref/窗宽决定形态；claim 失败（他人持租约/窄窗）→ 浮窗降级。 */
     private syncForm;
     private releaseLease;
@@ -147,16 +186,22 @@ export declare class PaneWindow extends Component<Record<string, never>, PaneWin
     private onWheelNative;
     private bindScreen;
     private forceRelease;
-    private toggleDebug;
-    private toggleRecord;
+    private fitScreen;
+    private confirmAction;
+    private openDirectory;
+    private browseDirectory;
+    private saveDirectory;
+    private captureAction;
+    private toggleCapture;
+    private previewOutput;
+    private fileUrl;
     private setQuality;
-    private tryShow;
     private tapOutline;
     /** B22f：采样当前显示元素（canvas/img）的亮度与方差，判定 FLAG_SECURE 页面是否实际可见。
      *  黑帧：mean≈0 且 std≈0；内容帧：mean 或 std 显著非零。连续 2 次可见才判定（防单帧抖动）。 */
     private sampleSecVisibility;
     private fetchOutline;
-    private bindMagnets;
+    private renderDialog;
     render(): ReturnType<typeof h>;
 }
 /** 头部入口按钮：渐变胶囊 + 光泽扫过 + 按压缩放 + 设备呼吸灯 + 面板开启高亮态。 */
@@ -164,6 +209,10 @@ export declare function PaneSidebarButton(): ReturnType<typeof h>;
 export declare const inject: string[];
 export declare function apply(ctx: {
     slots: {
+        entries(slot: string): Array<{
+            component: React.ElementType;
+            inject?: () => Rec;
+        }>;
         inject(slot: string, register: () => unknown): void;
         register(meta: Rec, component?: unknown): unknown;
     };

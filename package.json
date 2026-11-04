@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-android-pane",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Android 设备实时画面面板：模拟器/真机 H.264 串流进 DSH Web GUI，agent 可点按/截图/读控件树验证，人可上手共操作；对标 Claude Code iOS Simulator Pane",
   "private": true,
   "type": "module",
@@ -18,6 +18,7 @@
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-client-ui-slots": ">=0.1.0-rc <2",
     "@deepseek-ai/dsh-host-webserver": ">=0.1.0-rc <2",
+    "@deepseek-ai/dsh-host-directory-picker-native": ">=0.2.1-rc.2 <2",
     "@deepseek-ai/dsh-tools": ">=0.1.0-rc <2",
     "@deepseek-ai/schemastery": "^3.18.0"
   },
