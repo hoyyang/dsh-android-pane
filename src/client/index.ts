@@ -437,6 +437,10 @@ interface PaneWindowState {
   streamSize: { w: number; h: number } | null
   /** 停靠形态：右侧邻列（卡片详情页）占掉的宽度 —— 面板右边缘让位，排在它左边 */
   dockRight: number
+  /** dsh-project-manager 排版引擎给的宽度（0 = 用默认 DOCK_W） */
+  dockW?: number
+  /** 排版引擎把面板叠在右边（44px 竖条）：先藏起来 */
+  dockAway?: boolean
   capture:CaptureState|null
   captureBusy:boolean
   modal:'directory'|'settings'|'outputs'|'preview'|'confirm'|null
@@ -647,8 +651,11 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
   /** 停靠时盯右侧邻列（dsh-project-manager 的卡片详情列）：面板右边缘 = 它左边缘。 */
   private startNeighborWatch(): void {
     if (this.unwatchNeighbor != null) return
-    this.unwatchNeighbor = watchRightNeighbor((px) => {
-      if (px !== this.state.dockRight) this.setState({ dockRight: px })
+    this.unwatchNeighbor = watchRightNeighbor((px, led) => {
+      const dw = led?.width ?? 0, away = !!led?.away
+      if (px !== this.state.dockRight || dw !== (this.state.dockW ?? 0) || away !== !!this.state.dockAway) this.setState({ dockRight: px, dockW: dw, dockAway: away })
+      /* dsh-project-manager 统一排版时它负责给会话区让位 → 我们不再写 root margin（否则让两次）；没有它就照旧让 DOCK_W */
+      this.lease?.update(led ? 0 : DOCK_W)
     })
   }
 
@@ -1246,7 +1253,7 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
     const nav=(name:string,label:string,fn:()=>void)=>h('button',{className:'dap-btn2',disabled:unavailable,title:label,'aria-label':label,onClick:fn},icon(name))
     const errMsg=error??streamError??job?.error
     // Escape the host overlay slot's stacking context; fixed coordinates and dock lease stay unchanged.
-    return createPortal(h('div',{className:'dap-pane '+(form==='dock'?'dap-dock':'dap-overlay'),'data-dap-version':'0.2.0',role:'complementary','aria-label':'Android 设备面板',style:form==='dock'&&this.state.dockRight>0?{right:this.state.dockRight+'px'}:undefined},
+    return createPortal(h('div',{className:'dap-pane '+(form==='dock'?'dap-dock':'dap-overlay'),'data-dap-version':'0.2.0',role:'complementary','aria-label':'Android 设备面板',style:form==='dock'&&(this.state.dockRight>0||(this.state.dockW??0)>0||this.state.dockAway)?{right:this.state.dockRight+'px',...((this.state.dockW??0)>0?{width:this.state.dockW+'px'}:{}),...(this.state.dockAway?{visibility:'hidden',pointerEvents:'none'}:{})}:undefined},
       h('header',{className:'dap-head'},h('select',{className:'dap-select','aria-label':'选择设备',disabled:!!job||captureBusy,value:serial??'',onChange:(e:RChangeEvent<HTMLSelectElement>)=>{const next=e.target.value;if(next&&next!==serial){this.stopStream();this.setState({serial:next,mode:null,streamError:null,error:null,secure:null,secView:'stream',secSteps:null,outline:null,streamSize:null});void this.attach(next)}}},online.length?online.map(d=>h('option',{key:d.serial,value:d.serial},d.name??d.model??d.serial)):h('option',{value:''},'无在线设备')),
         h('button',{className:'dap-icon',disabled:!!job||captureBusy||claimSessionId!=null||busy,title:'重新连接设备','aria-label':'重新连接设备',onClick:()=>{if(serial)void this.attach(serial);else void this.poll()}},icon('refresh')),
         h('button',{className:'dap-icon',title:'面板设置','aria-label':'面板设置',onClick:()=>this.setState({modal:'settings'})},icon('settings')),

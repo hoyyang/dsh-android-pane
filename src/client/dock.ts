@@ -18,13 +18,15 @@ export interface DockLease {
 const NEIGHBOR_SEL = '.dpm-global-detail'
 
 /** 盯邻列，把「面板右边缘应让出的距离」回调出去；返回取消函数。
+ *  dsh-project-manager 发 dpm:columns 时以它为准（它统一排全部列）；没有这个事件（旧版 / 没装）就自己量详情列。
  *  详情开/关、拖宽、隐藏（data-dpm-gd="away"）、窗口缩放都实时跟随（事件驱动，不轮询）。 */
-export function watchRightNeighbor(apply: (rightPx: number) => void): () => void {
+export function watchRightNeighbor(apply: (rightPx: number, led?: { width: number; away: boolean }) => void): () => void {
   let det: HTMLElement | null = null
   let ro: ResizeObserver | null = null
   let attrs: MutationObserver | null = null
   let raf = 0
   let dead = false
+  let led = false
   const measure = (): number => {
     if (det == null || det.hidden || det.getAttribute('data-dpm-gd') === 'away') return 0
     const r = det.getBoundingClientRect()
@@ -34,7 +36,7 @@ export function watchRightNeighbor(apply: (rightPx: number) => void): () => void
   }
   const run = (): void => {
     raf = 0
-    if (!dead) apply(measure())
+    if (!dead && !led) apply(measure())
   }
   const soon = (): void => {
     if (!dead && raf === 0) raf = requestAnimationFrame(run)
@@ -57,12 +59,23 @@ export function watchRightNeighbor(apply: (rightPx: number) => void): () => void
     }
     soon()
   }
+  /* dsh-project-manager 0.57+ 有一个排版引擎管全部列（每日任务面板 | 卡片详情 | DSH 右侧栏 | Android），
+     它发 dpm:columns 告诉我们该贴的 right（或叠放 away）；收到过就只听它，不再自己量详情（详情不在最右时量出来是错的）。 */
+  const onCols = (e: Event): void => {
+    const d = (e as CustomEvent<{ ap?: { right?: number; width?: number; away?: boolean } | null } | null>).detail
+    if (d == null) { led = false; soon(); return }
+    led = true
+    const ap = d.ap
+    if (!dead) apply(ap && !ap.away && typeof ap.right === 'number' ? Math.max(0, Math.round(ap.right)) : 0, { width: ap && !ap.away && typeof ap.width === 'number' ? Math.round(ap.width) : 0, away: !!ap?.away })
+  }
+  window.addEventListener('dpm:columns', onCols)
   const bodyMo = new MutationObserver(bind)
   bodyMo.observe(document.body, { childList: true })
   window.addEventListener('resize', soon)
   bind()
   return () => {
     dead = true
+    window.removeEventListener('dpm:columns', onCols)
     bodyMo.disconnect()
     ro?.disconnect()
     attrs?.disconnect()
