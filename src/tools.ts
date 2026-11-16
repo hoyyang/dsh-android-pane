@@ -73,13 +73,14 @@ export function registerPaneTools(
         'First attach to a device is the consent point (user approves this tool call). Returns serial, stream mode/size and a first screenshot path — read that image to see the screen.',
       parameters: {
         serial: serialParam,
-        mode: { type: 'string', description: "'auto'=正常 H.264 串流（缺省）；'screenshot'=强制截图模式——该设备永不启动 scrcpy 串流，仅截图轮询交互，按设备持久保存（'auto' 恢复）。用于串流导致系统卡死/看门狗或硬件编码器崩溃的设备。", },
+        mode: { type: 'string', description: "'screenshot'=强制截图模式——该设备永不启动 scrcpy 串流，仅截图轮询交互，按设备持久保存。用于串流导致系统卡死/看门狗或硬件编码器崩溃的设备。注意：解除保护请在面板设置「串流模式」选自动串流——本工具传 'auto' 不会解除（防误清保护）。", },
       },
       output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }] },
       execute: async (args, ctx: ToolCtx) => {
-        const { serial, mode } = args as { serial?: string; mode?: string }
+        const { serial, mode } = args as { serial?: string; mode?: 'auto' | 'screenshot' }
         if (mode != null && mode !== 'auto' && mode !== 'screenshot') throw new Error('mode 须为 auto|screenshot')
-        return toJson(await hub.attachForTool(sessionIdOf(ctx), serial, ctx.signal, mode != null ? { mode } : undefined))
+        // P1（审查修复）：工具只允许施加保护、不允许解除——'auto' 不落偏好，防 agent 习惯性传默认值清掉强制标记；解除走面板设置
+        return toJson(await hub.attachForTool(sessionIdOf(ctx), serial, ctx.signal, mode === 'screenshot' ? { mode } : undefined))
       },
       timeoutMs: 60_000,
     }),
