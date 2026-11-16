@@ -53,6 +53,8 @@ export interface PaneState {
   outputs: CaptureOutput[]
   pending: PendingCapture[]
   volumeRestore: Record<string, number>
+  /** 按设备强制截图模式（值恒为 'screenshot'；缺该键 = auto 串流）。串流曾致系统级卡死的设备在此永久豁免。 */
+  streamMode: Record<string, 'screenshot'>
 }
 export const DEFAULT_QUALITY: QualityPrefs = { maxSize: 1280, maxFps: 30, videoBitRate: 8_000_000 }
 
@@ -93,6 +95,9 @@ export class PaneStateStore {
       directory: typeof raw.directory === 'string' && isAbsolute(raw.directory) ? raw.directory : resolve(dir, 'shots'),
       // Old state upgrades without moving/deleting old shots or granting arbitrary file previews.
       outputs: Array.isArray(raw.outputs) ? raw.outputs.filter(o => o && typeof o.id === 'string' && ['screenshot', 'record', 'debug'].includes(o.type) && Array.isArray(o.files) && o.files.every(f => typeof f === 'string' && isAbsolute(f)) && Array.isArray(o.identities) && o.identities.length === o.files.length) : [],
+      streamMode: raw.streamMode != null && typeof raw.streamMode === 'object' && !Array.isArray(raw.streamMode)
+        ? Object.fromEntries(Object.entries(raw.streamMode).filter(([, v]) => v === 'screenshot'))
+        : {},
     }
     mkdirSync(dir, { recursive: true })
     return new PaneStateStore(file, state)
@@ -108,6 +113,12 @@ export class PaneStateStore {
   setQuality(patch: Partial<QualityPrefs>): QualityPrefs {
     this.flush({ quality: { ...this.cached.quality, ...patch } })
     return { ...this.cached.quality }
+  }
+  setStreamMode(serial: string, mode: 'auto' | 'screenshot'): void {
+    const streamMode = { ...PaneStateStore.open(dirname(this.file)).data.streamMode }
+    if (mode === 'auto') delete streamMode[serial]
+    else streamMode[serial] = 'screenshot'
+    this.flush({ streamMode })
   }
   setDirectory(directory: string): string {
     const validated = validateCaptureDirectory(directory)

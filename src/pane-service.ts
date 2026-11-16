@@ -139,6 +139,8 @@ export interface DeviceView {
   claimedBy: string | null
   busy: boolean
   mode: 'h264' | 'poll' | null
+  /** 用户/agent 偏好：'screenshot' = 该设备永不启动 scrcpy 串流（防串流致系统卡死），仅截图轮询 */
+  streamMode: 'auto' | 'screenshot'
 }
 
 export interface ActRequest {
@@ -331,6 +333,7 @@ export class PaneHub {
         claimedBy: this.claims.get(d.serial)?.sessionId ?? null,
         busy: (this.busyUntil.get(d.serial) ?? 0) > now,
         mode: this.modes.get(d.serial) ?? null,
+        streamMode: this.state.data.streamMode[d.serial] === 'screenshot' ? 'screenshot' : 'auto',
         name: name.replace(/\s+/g, ' ').trim(),
       }
     })
@@ -356,7 +359,7 @@ export class PaneHub {
   }
 
   /** 工具 attach（agent 路径）：DSH 工具审批 = 首次授权点，创建会话级认领。 */
-  async attachForTool(sessionId: string, serial: string | undefined, signal?: AbortSignal): Promise<{
+  async attachForTool(sessionId: string, serial: string | undefined, signal?: AbortSignal, prefs?: { mode?: 'auto' | 'screenshot' }): Promise<{
     serial: string
     model: string | null
     isEmulator: boolean
@@ -365,6 +368,7 @@ export class PaneHub {
     deviceName: string | null
     screenshotPath: string | null
     streamError: string | null
+    streamMode: 'auto' | 'screenshot'
   }> {
     const devices = await this.ensureDevices()
     let target: AdbDevice | undefined
@@ -423,9 +427,14 @@ export class PaneHub {
       }
     }
 
+    // 按设备流偏好（本次 attach 携带则持久化）：'screenshot' = 永不启动 scrcpy（防串流致系统卡死设备复发）
+    if (prefs?.mode != null) this.state.setStreamMode(s, prefs.mode)
+    const forced = this.state.data.streamMode[s] === 'screenshot'
     // 串流：优先 h264，失败降级 poll（规则6/MVP）
     const mode = await this.ensureStream(s, signal)
-    const streamError: string | null = mode === 'poll' ? (this.streamErrors.get(s) ?? 'poll 模式（此前 scrcpy 启动失败）') : null
+    const streamError: string | null = forced
+      ? null // 强制截图模式是刻意选择，不是故障：置空防客户端误走「poll 重试」分支
+      : mode === 'poll' ? (this.streamErrors.get(s) ?? 'poll 模式（此前 scrcpy 启动失败）') : null
     const meta = this.streams.get(s)?.info ?? null
     const size: { w: number; h: number } | null = meta != null ? { w: meta.streamWidth, h: meta.streamHeight } : null
     const deviceName: string | null = meta?.deviceName || null
@@ -436,7 +445,7 @@ export class PaneHub {
     this.seenDetached.delete(s)
     void this.checkSecure(s, signal).catch(() => undefined) // B22: attach 即检，横幅最迟 2.5s 内出现
     const shot = await this.saveScreenshot(s, signal).catch(() => null)
-    return { serial: s, model: target.model, isEmulator: target.isEmulator, mode, size, deviceName, screenshotPath: shot, streamError }
+    return { serial: s, model: target.model, isEmulator: target.isEmulator, mode, size, deviceName, screenshotPath: shot, streamError, streamMode: forced ? 'screenshot' : 'auto' }
   }
 
   /** 面板 attach（观察者路径）：用户手势即授权；只确保串流在跑，不创建认领、不与 agent 抢设备。 */
@@ -447,6 +456,7 @@ export class PaneHub {
     mode: 'h264' | 'poll'
     size: { w: number; h: number } | null
     streamError: string | null
+    streamMode: 'auto' | 'screenshot'
   }> {
     const devices = await this.ensureDevices()
     const target = devices.find((d) => d.serial === serial)
@@ -464,13 +474,15 @@ export class PaneHub {
     await this.ensureStream(s, signal)
     void this.checkSecure(s, signal).catch(() => undefined) // B22: 观察路径同检
     const meta = this.streams.get(s)?.info ?? null
+    const forcedViewer = this.state.data.streamMode[s] === 'screenshot'
     return {
       serial: s,
       model: target.model,
       isEmulator: target.isEmulator,
-      mode: this.modes.get(s) ?? 'h264',
+      mode: this.modes.get(s) ?? (forcedViewer ? 'poll' : 'h264'),
       size: meta != null ? { w: meta.streamWidth, h: meta.streamHeight } : null,
-      streamError: this.streamErrors.get(s) ?? null,
+      streamError: forcedViewer ? null : (this.streamErrors.get(s) ?? null),
+      streamMode: forcedViewer ? 'screenshot' : 'auto',
     }
   }
 
@@ -527,6 +539,19 @@ export class PaneHub {
   }
 
   private async ensureStreamInner(s: string, signal?: AbortSignal): Promise<'h264' | 'poll'> {
+    // 强制截图模式（防设备卡死）：该设备串流曾触发系统级 binder 互等/看门狗（2026-11-13 实测根因）。
+    // 永不拉起 scrcpy；旧流还在则先停。置于保险丝计数之前——刻意模式不该消耗重启预算。
+    if (this.state.data.streamMode[s] === 'screenshot') {
+      const live = this.streams.get(s)
+      if (live != null) {
+        live.stop()
+        this.streams.delete(s)
+      }
+      this.modes.set(s, 'poll')
+      this.pollSince.set(s, Date.now())
+      this.streamErrors.delete(s)
+      return 'poll'
+    }
     // 冷却机制已移除（互斥防风暴；显式 attach/act 必须总是尝试恢复——否则自愈被挡，实测教训）
     let session = this.streams.get(s)
     if (session == null || !session.running) {
@@ -1839,6 +1864,22 @@ export class PaneHub {
       }
     }
     return q
+  }
+
+  /** 按设备设置流偏好（面板/路由入口）。'screenshot' 立即停掉在跑串流；'auto' 由下次 attach 恢复串流。 */
+  setStreamMode(serial: string, mode: 'auto' | 'screenshot'): { serial: string; streamMode: 'auto' | 'screenshot' } {
+    this.state.setStreamMode(serial, mode)
+    if (mode === 'screenshot') {
+      const live = this.streams.get(serial)
+      if (live != null) {
+        live.stop()
+        this.streams.delete(serial)
+        this.modes.delete(serial)
+      }
+      this.streamErrors.delete(serial)
+    }
+    this.opts.log(`[${serial}] 流偏好 → ${mode}${mode === 'screenshot' ? '（防串流致系统卡死）' : ''}`)
+    return { serial, streamMode: mode }
   }
 
   /** 还原设备原输入法。 */

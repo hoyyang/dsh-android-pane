@@ -122,6 +122,8 @@ export interface DeviceView {
     claimedBy: string | null;
     busy: boolean;
     mode: 'h264' | 'poll' | null;
+    /** 用户/agent 偏好：'screenshot' = 该设备永不启动 scrcpy 串流（防串流致系统卡死），仅截图轮询 */
+    streamMode: 'auto' | 'screenshot';
 }
 export interface ActRequest {
     action: 'tap' | 'swipe' | 'key' | 'text' | 'scroll' | 'back' | 'home' | 'recents' | 'volume_up' | 'volume_down' | 'rotate';
@@ -207,7 +209,9 @@ export declare class PaneHub {
         }>;
     }>;
     /** 工具 attach（agent 路径）：DSH 工具审批 = 首次授权点，创建会话级认领。 */
-    attachForTool(sessionId: string, serial: string | undefined, signal?: AbortSignal): Promise<{
+    attachForTool(sessionId: string, serial: string | undefined, signal?: AbortSignal, prefs?: {
+        mode?: 'auto' | 'screenshot';
+    }): Promise<{
         serial: string;
         model: string | null;
         isEmulator: boolean;
@@ -219,6 +223,7 @@ export declare class PaneHub {
         deviceName: string | null;
         screenshotPath: string | null;
         streamError: string | null;
+        streamMode: 'auto' | 'screenshot';
     }>;
     /** 面板 attach（观察者路径）：用户手势即授权；只确保串流在跑，不创建认领、不与 agent 抢设备。 */
     attachViewer(serial: string, signal?: AbortSignal): Promise<{
@@ -231,6 +236,7 @@ export declare class PaneHub {
             h: number;
         } | null;
         streamError: string | null;
+        streamMode: 'auto' | 'screenshot';
     }>;
     private ensuring;
     /** 每设备最近一次成功流的坐标系（流↔物理），供 adb 兜底路径换算（adb input 只认物理坐标）。 */
@@ -452,6 +458,11 @@ export declare class PaneHub {
         note: string;
     }>;
     setQuality(patch: Partial<QualityPrefs>): Promise<QualityPrefs>;
+    /** 按设备设置流偏好（面板/路由入口）。'screenshot' 立即停掉在跑串流；'auto' 由下次 attach 恢复串流。 */
+    setStreamMode(serial: string, mode: 'auto' | 'screenshot'): {
+        serial: string;
+        streamMode: 'auto' | 'screenshot';
+    };
     /** 还原设备原输入法。 */
     private restoreIme;
     dispose(): void;

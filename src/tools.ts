@@ -52,7 +52,7 @@ export function registerPaneTools(
     defineTool({
       name: 'android_pane_devices',
       description:
-        'List Android devices (real + emulator) with online state, model, panel claim owner and stream mode. Use before attach to pick a serial.',
+        'List Android devices (real + emulator) with online state, model, panel claim owner, live stream mode and per-device streamMode preference (auto|screenshot). Use before attach to pick a serial.',
       parameters: {},
       output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }] },
       execute: async (_args, ctx: ToolCtx) => {
@@ -69,13 +69,17 @@ export function registerPaneTools(
     defineTool({
       name: 'android_pane_attach',
       description:
-        'Claim an Android device for this session and open its live screen in the DSH pane (H.264 stream; auto-fallback to screenshot polling). ' +
+        'Claim an Android device for this session and open its live screen in the DSH pane (H.264 stream; auto-fallback to screenshot polling; per-device mode=screenshot forces screenshot-only, persisted — use it when streaming froze the device/system watchdog). ' +
         'First attach to a device is the consent point (user approves this tool call). Returns serial, stream mode/size and a first screenshot path — read that image to see the screen.',
-      parameters: { serial: serialParam },
+      parameters: {
+        serial: serialParam,
+        mode: { type: 'string', description: "'auto'=正常 H.264 串流（缺省）；'screenshot'=强制截图模式——该设备永不启动 scrcpy 串流，仅截图轮询交互，按设备持久保存（'auto' 恢复）。用于串流导致系统卡死/看门狗或硬件编码器崩溃的设备。", },
+      },
       output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }] },
       execute: async (args, ctx: ToolCtx) => {
-        const { serial } = args as { serial?: string }
-        return toJson(await hub.attachForTool(sessionIdOf(ctx), serial, ctx.signal))
+        const { serial, mode } = args as { serial?: string; mode?: string }
+        if (mode != null && mode !== 'auto' && mode !== 'screenshot') throw new Error('mode 须为 auto|screenshot')
+        return toJson(await hub.attachForTool(sessionIdOf(ctx), serial, ctx.signal, mode != null ? { mode } : undefined))
       },
       timeoutMs: 60_000,
     }),

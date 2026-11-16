@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.2 (2026-11-13)
+
+### Added
+
+- **按设备强制截图模式（防串流卡死）**：实测某真机在 H.264 串流下触发系统级 binder 互等（system_server `createVirtualDisplay` ↔ surfaceflinger `setPowerMode` ↔ scrcpy video 线程闭环），系统看门狗判定卡死并重启，另有硬件编码器 `c2.qti.avc.encoder` 反复 SIGSEGV。插件原先只在串流启动失败时降级截图，下一次 attach 会重新拉起串流。现在：
+  - `android_pane_attach` 新增 `mode` 参数（`auto`｜`screenshot`）：`screenshot` 强制该设备**永不启动 scrcpy 串流**，仅截图轮询交互，按设备持久保存在 state.json（`auto` 恢复）；
+  - `android_pane_devices` 返回每台设备的 `streamMode` 偏好；面板设置新增「串流模式」开关（强制截图 · 防卡死），设备列表对强制设备标注「· 截图模式」；
+  - 新增 `POST /_dsh/dsh-android-pane/stream-mode` 路由（同源守卫）；
+  - 强制模式下点按/滑动/文字/元素操作/录屏/调试（adb screenrecord 通道）全部照常，仅停用 H.264 镜像；`/stream` 返回 409，`/frame` 截图轮询正常；
+  - 强制模式置空 `streamError`（刻意选择而非故障），不触发客户端 poll 重试分支；置于重启保险丝计数之前，不消耗重启预算。
+
+### Fixed
+
+- 强制截图模式下 attach 不再误报「poll 模式（此前 scrcpy 启动失败）」类故障错误。
+
 ## 0.2.1 (2026-11-04)
 
 ### Fixed

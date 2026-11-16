@@ -54,6 +54,8 @@ export interface PaneState {
     outputs: CaptureOutput[];
     pending: PendingCapture[];
     volumeRestore: Record<string, number>;
+    /** 按设备强制截图模式（值恒为 'screenshot'；缺该键 = auto 串流）。串流曾致系统级卡死的设备在此永久豁免。 */
+    streamMode: Record<string, 'screenshot'>;
 }
 export declare const DEFAULT_QUALITY: QualityPrefs;
 /** No relative/device/browser paths. Probe the actual host directory before committing a preference. */
@@ -69,6 +71,7 @@ export declare class PaneStateStore {
     trust(serial: string): void;
     untrust(serial: string): void;
     setQuality(patch: Partial<QualityPrefs>): QualityPrefs;
+    setStreamMode(serial: string, mode: 'auto' | 'screenshot'): void;
     setDirectory(directory: string): string;
     upsertPending(job: PendingCapture): void;
     setVolumeRestore(serial: string, value?: number): void;

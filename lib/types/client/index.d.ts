@@ -34,6 +34,7 @@ interface DeviceRow {
     claimedBy: string | null;
     busy: boolean;
     mode: 'h264' | 'poll' | null;
+    streamMode?: 'auto' | 'screenshot';
 }
 type PaneForm = 'dock' | 'overlay';
 interface CaptureJob {
@@ -66,6 +67,8 @@ interface PaneWindowState {
     busy: boolean;
     claimsSeen: boolean;
     mode: 'h264' | 'poll' | null;
+    /** 当前设备的流偏好：screenshot = 强制截图模式（永不串流，防卡死复发） */
+    streamMode: 'auto' | 'screenshot';
     error: string | null;
     streamError: string | null;
     fps: number;
@@ -104,6 +107,10 @@ interface PaneWindowState {
     } | null;
     /** 停靠形态：右侧邻列（卡片详情页）占掉的宽度 —— 面板右边缘让位，排在它左边 */
     dockRight: number;
+    /** dsh-project-manager 排版引擎给的宽度（0 = 用默认 DOCK_W） */
+    dockW?: number;
+    /** 排版引擎把面板叠在右边（44px 竖条）：先藏起来 */
+    dockAway?: boolean;
     capture: CaptureState | null;
     captureBusy: boolean;
     modal: 'directory' | 'settings' | 'outputs' | 'preview' | 'confirm' | null;
@@ -196,6 +203,8 @@ export declare class PaneWindow extends Component<Record<string, never>, PaneWin
     private previewOutput;
     private fileUrl;
     private setQuality;
+    /** 按设备切换流偏好。切到 screenshot：服务端立即停串流；重连后进入截图轮询并落提示。 */
+    private setStreamMode;
     private tapOutline;
     /** B22f：采样当前显示元素（canvas/img）的亮度与方差，判定 FLAG_SECURE 页面是否实际可见。
      *  黑帧：mean≈0 且 std≈0；内容帧：mean 或 std 显著非零。连续 2 次可见才判定（防单帧抖动）。 */

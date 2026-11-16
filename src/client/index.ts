@@ -167,6 +167,7 @@ interface DeviceRow {
   claimedBy: string | null
   busy: boolean
   mode: 'h264' | 'poll' | null
+  streamMode?: 'auto' | 'screenshot'
 }
 
 async function api<T = Rec>(path: string, body?: Rec, options: RequestInit = {}): Promise<T> {
@@ -418,6 +419,8 @@ interface PaneWindowState {
   busy: boolean
   claimsSeen: boolean
   mode: 'h264' | 'poll' | null
+  /** 当前设备的流偏好：screenshot = 强制截图模式（永不串流，防卡死复发） */
+  streamMode: 'auto' | 'screenshot'
   error: string | null
   streamError: string | null
   fps: number
@@ -482,6 +485,7 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
     busy: false,
     claimsSeen: false,
     mode: null,
+    streamMode: 'auto',
     error: null,
     streamError: null,
     fps: 0,
@@ -794,16 +798,16 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
     const stale = (): boolean => seq !== this.attachSeq
     this.setState({ error: null })
     try {
-      const r = await api<{ serial: string; mode: 'h264' | 'poll'; size: { w: number; h: number } | null; streamError: string | null }>('/attach', { serial })
+      const r = await api<{ serial: string; mode: 'h264' | 'poll'; size: { w: number; h: number } | null; streamError: string | null; streamMode?: 'auto' | 'screenshot' }>('/attach', { serial })
       if (stale()) return
       if (r.mode === 'poll' && !retried && r.streamError != null) {
-        // 设备端 encoder 释放竞态等瞬态失败：1.5s 后重试一次
+        // 设备端 encoder 释放竞态等瞬态失败：1.5s 后重试一次（强制截图模式 streamError=null，不会进此分支）
         await new Promise((res) => setTimeout(res, 1_500))
         if (stale()) return
         return this.attach(serial, true)
       }
       if (stale()) return
-      this.setState({ serial: r.serial, mode: r.mode, streamError: r.streamError, error: null })
+      this.setState({ serial: r.serial, mode: r.mode, streamError: r.streamError, streamMode: r.streamMode ?? 'auto', error: null })
       this.stopStream()
       if (r.mode === 'h264') {
         const gen = seq
@@ -1152,6 +1156,22 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
     }
   }
 
+  /** 按设备切换流偏好。切到 screenshot：服务端立即停串流；重连后进入截图轮询并落提示。 */
+  private async setStreamMode(mode: 'auto' | 'screenshot'): Promise<void> {
+    const serial = this.state.serial
+    if (serial == null) return
+    try {
+      const r = await api<{ serial: string; streamMode: 'auto' | 'screenshot' }>('/stream-mode', { serial, mode })
+      this.setState({ streamMode: r.streamMode, note: r.streamMode === 'screenshot' ? '已强制截图模式：该设备不再启动串流（防卡死复发），画面转为截图轮询。' : '已恢复自动串流，下次连接生效。' })
+      if (this.state.mode != null) {
+        this.stopStream()
+        await this.attach(serial)
+      }
+    } catch (e) {
+      this.setState({ error: String(e instanceof Error ? e.message : e).slice(0, 200) })
+    }
+  }
+
   private tapOutline(x: number, y: number): void {
     void this.act({ action: 'tap', x, y, coordinateSpace:'physical' })
   }
@@ -1219,6 +1239,7 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
       h('div',{className:'dap-dialog-actions'},h('button',{type:'button',className:'dap-quiet',onClick:close},'取消'),h('button',{type:'submit',className:'dap-primary',disabled:locked},'保存设置')))
     else if(modal==='settings')body=h('div',null,
       h('div',{className:'dap-setting-row'},h('span',null,'画面质量'),h('select',{'aria-label':'画面质量',value:quality.maxFps>=60?'clear':'smooth',disabled:locked||this.state.busy||this.state.claimSessionId!=null,onChange:(e:RChangeEvent<HTMLSelectElement>)=>void this.setQuality(e.target.value==='clear'?1920:1280,e.target.value==='clear'?60:30)},h('option',{value:'smooth'},'流畅 · 30 fps'),h('option',{value:'clear'},'清晰 · 60 fps'))),
+      h('div',{className:'dap-setting-row'},h('span',null,'串流模式'),h('select',{'aria-label':'串流模式',value:this.state.streamMode,disabled:locked,onChange:(e:RChangeEvent<HTMLSelectElement>)=>{if(this.state.serial)void this.setStreamMode(e.target.value as 'auto'|'screenshot')}},h('option',{value:'auto'},'自动串流 · H.264 实时'),h('option',{value:'screenshot'},'强制截图 · 防卡死'))),
       h('div',{className:'dap-setting-row'},h('span',null,'保存目录'),h('button',{className:'dap-quiet',onClick:()=>this.openDirectory()},'修改目录')))
     else if(modal==='outputs')body=h('div',{className:'dap-output-list'},capture?.outputs.length?capture.outputs.slice().reverse().map(output=>h('article',{className:'dap-output',key:output.id},
       h('div',{className:'dap-output-top'},icon(output.type==='screenshot'?'camera':output.type==='record'?'video':'debug'),h('b',null,output.type==='screenshot'?'截图':output.type==='record'?'录屏':'调试记录'),h('time',null,new Date(output.at).toLocaleTimeString('zh-CN',{hour12:false,hour:'2-digit',minute:'2-digit'}))),
@@ -1254,7 +1275,7 @@ export class PaneWindow extends Component<Record<string, never>, PaneWindowState
     const errMsg=error??streamError??job?.error
     // Escape the host overlay slot's stacking context; fixed coordinates and dock lease stay unchanged.
     return createPortal(h('div',{className:'dap-pane '+(form==='dock'?'dap-dock':'dap-overlay'),'data-dap-version':'0.2.0',role:'complementary','aria-label':'Android 设备面板',style:form==='dock'&&(this.state.dockRight>0||(this.state.dockW??0)>0||this.state.dockAway)?{right:this.state.dockRight+'px',...((this.state.dockW??0)>0?{width:this.state.dockW+'px'}:{}),...(this.state.dockAway?{visibility:'hidden',pointerEvents:'none'}:{})}:undefined},
-      h('header',{className:'dap-head'},h('select',{className:'dap-select','aria-label':'选择设备',disabled:!!job||captureBusy,value:serial??'',onChange:(e:RChangeEvent<HTMLSelectElement>)=>{const next=e.target.value;if(next&&next!==serial){this.stopStream();this.setState({serial:next,mode:null,streamError:null,error:null,secure:null,secView:'stream',secSteps:null,outline:null,streamSize:null});void this.attach(next)}}},online.length?online.map(d=>h('option',{key:d.serial,value:d.serial},d.name??d.model??d.serial)):h('option',{value:''},'无在线设备')),
+      h('header',{className:'dap-head'},h('select',{className:'dap-select','aria-label':'选择设备',disabled:!!job||captureBusy,value:serial??'',onChange:(e:RChangeEvent<HTMLSelectElement>)=>{const next=e.target.value;if(next&&next!==serial){this.stopStream();this.setState({serial:next,mode:null,streamMode:'auto',streamError:null,error:null,secure:null,secView:'stream',secSteps:null,outline:null,streamSize:null});void this.attach(next)}}},online.length?online.map(d=>h('option',{key:d.serial,value:d.serial},(d.name??d.model??d.serial)+(d.streamMode==='screenshot'?' · 截图模式':''))):h('option',{value:''},'无在线设备')),
         h('button',{className:'dap-icon',disabled:!!job||captureBusy||claimSessionId!=null||busy,title:'重新连接设备','aria-label':'重新连接设备',onClick:()=>{if(serial)void this.attach(serial);else void this.poll()}},icon('refresh')),
         h('button',{className:'dap-icon',title:'面板设置','aria-label':'面板设置',onClick:()=>this.setState({modal:'settings'})},icon('settings')),
         h('button',{className:'dap-icon',title:form==='dock'?'切换浮窗':'恢复停靠','aria-label':form==='dock'?'切换浮窗':'恢复停靠',onClick:()=>this.toggleForm()},icon('float')),
